@@ -18,6 +18,7 @@
       "main.js",
       "preload.js",
       "sox-recorder.js",
+      "entitlements.mac.plist",
       "index.html",
       "renderer.js",
       "package.json",
@@ -30,14 +31,19 @@
       }
     ],
     "mac": {
-      "forceCodeSigning": false,
-      "identity": null,
-      "hardenedRuntime": false,
+      "identity": "ETHAN ALLISON (GMVTGR644V)",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "entitlements.mac.plist",
+      "entitlementsInherit": "entitlements.mac.plist",
+      "notarize": true,
       "icon": "icon.icns",
       "target": [
         {
           "target": "dmg",
-          "arch": ["arm64"]
+          "arch": [
+            "arm64"
+          ]
         }
       ],
       "category": "public.app-category.productivity"
@@ -46,7 +52,9 @@
       "target": [
         {
           "target": "nsis",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ],
       "icon": "icon-256.png"
@@ -60,7 +68,7 @@
     }
   },
   "devDependencies": {
-    "electron": "^28.0.0",
+    "electron": "^28.3.3",
     "electron-builder": "^26.8.1"
   },
   "dependencies": {
