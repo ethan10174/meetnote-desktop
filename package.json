@@ -1,0 +1,60 @@
+{
+  "name": "meetnote-desktop",
+  "version": "1.0.0",
+  "description": "MeetNote – AI meeting recorder and summarizer",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --mac"
+  },
+  "build": {
+    "appId": "com.meetnote.app",
+    "productName": "MeetNote",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "sox-recorder.js",
+      "index.html",
+      "renderer.js",
+      "package.json",
+      "node_modules/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "resources/sox",
+        "to": "sox"
+      }
+    ],
+    "mac": {
+      "forceCodeSigning": false,
+      "identity": null,
+      "hardenedRuntime": false,
+      "icon": "icon.icns",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": ["arm64"]
+        }
+      ],
+      "category": "public.app-category.productivity"
+    },
+    "dmg": {
+      "title": "MeetNote",
+      "window": {
+        "width": 540,
+        "height": 380
+      }
+    }
+  },
+  "devDependencies": {
+    "electron": "^28.0.0",
+    "electron-builder": "^26.8.1"
+  },
+  "dependencies": {
+    "electron-store": "^11.0.2",
+    "node-record-lpcm16": "^1.0.1"
+  }
+}
