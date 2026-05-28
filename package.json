@@ -5,7 +5,8 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "dist": "electron-builder --mac"
+    "dist": "electron-builder --mac",
+    "dist-win": "electron-builder --win"
   },
   "build": {
     "appId": "com.meetnote.app",
@@ -40,6 +41,15 @@
         }
       ],
       "category": "public.app-category.productivity"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ],
+      "icon": "icon-256.png"
     },
     "dmg": {
       "title": "MeetNote",
