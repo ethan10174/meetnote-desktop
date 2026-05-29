@@ -36,7 +36,7 @@
       "gatekeeperAssess": false,
       "entitlements": "entitlements.mac.plist",
       "entitlementsInherit": "entitlements.mac.plist",
-      "notarize": false,
+      "notarize": true,
       "icon": "icon.icns",
       "target": [
         {
