@@ -8,6 +8,10 @@ module.exports = async (context) => {
 
   const { APPLE_API_KEY, APPLE_API_KEY_ID, APPLE_API_ISSUER } = process.env;
 
+  console.log('[notarize] APPLE_API_KEY_ID:', APPLE_API_KEY_ID);
+  console.log('[notarize] APPLE_API_ISSUER:', APPLE_API_ISSUER);
+  console.log('[notarize] APPLE_API_KEY set:', !!APPLE_API_KEY);
+
   if (!APPLE_API_KEY || !APPLE_API_KEY_ID || !APPLE_API_ISSUER) {
     console.warn('[notarize] skipping — APPLE_API_KEY, APPLE_API_KEY_ID, or APPLE_API_ISSUER not set');
     return;
