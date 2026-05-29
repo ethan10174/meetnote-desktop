@@ -5,13 +5,12 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "dist": "electron-builder --mac",
+    "dist": "electron-builder --mac --publish never",
     "dist-win": "electron-builder --win"
   },
   "build": {
     "appId": "com.meetnote.app",
     "productName": "MeetNote",
-    "publish": "never",
     "directories": {
       "output": "dist"
     },
