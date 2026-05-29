@@ -38,9 +38,7 @@
       "signingHashAlgorithms": ["sha256"],
       "entitlements": "entitlements.mac.plist",
       "entitlementsInherit": "entitlements.mac.plist",
-      "notarize": {
-        "teamId": "GMVTGR644V"
-      },
+      "notarize": true,
       "icon": "icon.icns",
       "target": [
         {
