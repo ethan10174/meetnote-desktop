@@ -35,7 +35,6 @@
       "identity": "ETHAN ALLISON (GMVTGR644V)",
       "hardenedRuntime": true,
       "gatekeeperAssess": false,
-      "signingHashAlgorithms": ["sha256"],
       "entitlements": "entitlements.mac.plist",
       "entitlementsInherit": "entitlements.mac.plist",
       "notarize": true,
