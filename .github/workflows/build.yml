@@ -30,7 +30,7 @@ jobs:
       - name: Build and sign DMG
         env:
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_KEY_ISSUER }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           CSC_LINK: ${{ secrets.CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
