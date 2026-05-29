@@ -23,9 +23,7 @@ jobs:
         run: npm install
 
       - name: Debug secrets
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-        run: echo "APPLE_ID is: $APPLE_ID"
+        run: echo "APPLE_ID set ${{ secrets.APPLE_ID != '' }}"
 
       - name: Build and sign DMG
         env:
