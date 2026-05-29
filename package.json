@@ -11,6 +11,7 @@
   "build": {
     "appId": "com.meetnote.app",
     "productName": "MeetNote",
+    "afterSign": "notarize.js",
     "directories": {
       "output": "dist"
     },
@@ -18,6 +19,7 @@
       "main.js",
       "preload.js",
       "sox-recorder.js",
+      "notarize.js",
       "entitlements.mac.plist",
       "index.html",
       "renderer.js",
@@ -36,7 +38,7 @@
       "gatekeeperAssess": false,
       "entitlements": "entitlements.mac.plist",
       "entitlementsInherit": "entitlements.mac.plist",
-      "notarize": true,
+      "notarize": false,
       "icon": "icon.icns",
       "target": [
         {
