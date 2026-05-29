@@ -36,7 +36,9 @@
       "gatekeeperAssess": false,
       "entitlements": "entitlements.mac.plist",
       "entitlementsInherit": "entitlements.mac.plist",
-      "notarize": true,
+      "notarize": {
+        "teamId": "GMVTGR644V"
+      },
       "icon": "icon.icns",
       "target": [
         {
