@@ -34,6 +34,7 @@ jobs:
           CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CSC_FOR_PULL_REQUEST: 'true'
+          NO_NOTARIZE: 'true'
           TIMESTAMP_SERVER: 'http://timestamp.apple.com/ts01'
           ELECTRON_BUILDER_SIGN_TIMEOUT: '120000'
         run: npm run dist
