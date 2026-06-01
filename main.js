@@ -21,6 +21,7 @@ function createWindow() {
     width: 1200,
     height: 800,
     resizable: true,
+    autoHideMenuBar: true,
     title: 'MeetNote',
     icon: path.join(__dirname, 'icon.icns'),
     webPreferences: {
@@ -68,8 +69,12 @@ function createWindow() {
   });
 
   wc.on('will-navigate', (event, url) => {
+    if (url.includes('accounts.google.com')) {
+      event.preventDefault();
+      shell.openExternal(url);
+      return;
+    }
     const allowed =
-      url.includes('accounts.google.com') ||
       url.includes('dpikisphgxwcysvvvltf.supabase.co') ||
       url.includes(NEXT_URL) ||
       (url.startsWith('file://') && url.includes('frontend-build'));
@@ -101,6 +106,8 @@ ipcMain.handle('get-desktop-sources', async () => {
 
 // ── IPC: start native mic recording ──────────────────────────────────────────
 ipcMain.handle('start-recording', async () => {
+  if (process.platform === 'win32') return { error: 'USE_BROWSER_RECORDER' };
+
   if (recorderInstance) {
     recorderInstance.stop();
     recorderInstance = null;
@@ -201,23 +208,24 @@ ipcMain.handle('pick-and-upload-file', async (event) => {
 // AppleScript to check whether any Chrome tab has meet.google.com open.
 // Written once to a stable tmp path so it isn't recreated on every check.
 const MEET_SCRIPT_PATH = path.join(os.tmpdir(), 'mn-meet-check.applescript');
-// disabled until permissions are properly handled
-// fs.writeFileSync(MEET_SCRIPT_PATH, `\
-// tell application "System Events"
-//   if (name of processes) contains "Google Chrome" then
-//     tell application "Google Chrome"
-//       repeat with w in windows
-//         repeat with t in tabs of w
-//           if URL of t contains "meet.google.com" then
-//             return "found"
-//           end if
-//         end repeat
-//       end repeat
-//     end tell
-//   end if
-// end tell
-// return "not found"
-// `);
+try {
+  fs.writeFileSync(MEET_SCRIPT_PATH, `\
+tell application "System Events"
+  if (name of processes) contains "Google Chrome" then
+    tell application "Google Chrome"
+      repeat with w in windows
+        repeat with t in tabs of w
+          if URL of t contains "meet.google.com" then
+            return "found"
+          end if
+        end repeat
+      end repeat
+    end tell
+  end if
+end tell
+return "not found"
+`);
+} catch {};
 
 let meetingActive        = false; // is a meeting currently detected?
 let hasNotifiedForMeeting = false; // have we shown the notification for this meeting?
@@ -231,11 +239,11 @@ function isMeetingRunning() {
       return true;
     } catch {}
 
-    // Google Meet in Chrome — disabled until permissions are properly handled
-    // try {
-    //   const out = execSync(`osascript "${MEET_SCRIPT_PATH}"`, { encoding: 'utf8' }).trim();
-    //   if (out === 'found') return true;
-    // } catch {}
+    // Google Meet in Chrome
+    try {
+      const out = execSync(`osascript "${MEET_SCRIPT_PATH}"`, { encoding: 'utf8' }).trim();
+      if (out === 'found') return true;
+    } catch {}
 
     return false;
   } catch {
@@ -296,7 +304,7 @@ app.whenReady().then(async () => {
   }
 
   createWindow();
-  // detectionInterval = setInterval(checkAndNotify, 30_000); // disabled until permissions are properly handled
+  detectionInterval = setInterval(checkAndNotify, 30_000);
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
