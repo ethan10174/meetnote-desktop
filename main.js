@@ -1,20 +1,81 @@
 process.env.PATH = '/opt/homebrew/bin:' + process.env.PATH;
 
 const {
-  app, BrowserWindow, ipcMain, desktopCapturer,
+  app, BrowserWindow, ipcMain,
   session, systemPreferences, dialog, Notification, shell,
 } = require('electron');
+const nativeBridge = require('./native-bridge');
 const path           = require('path');
 const fs             = require('fs');
 const os             = require('os');
 const { execSync }   = require('child_process');
-const recorder       = require('node-record-lpcm16');
+const http           = require('http');
 
 const NEXT_URL    = 'https://meeting-frontend-ashy.vercel.app';
 const BACKEND_URL = 'https://meeting-backend-production-ca80.up.railway.app/upload';
 
-let activeRecording  = null; // { process, fileStream, filePath }
-let recorderInstance = null; // the node-record-lpcm16 Recording object
+let oauthServer = null; // loopback HTTP server used during OAuth
+
+// Starts a temporary HTTP server on a random port.
+// Returns { port, server, tokenPromise } where tokenPromise resolves with
+// { hash, search } once the browser posts back the OAuth callback fragment.
+function startOAuthServer() {
+  return new Promise((resolve, reject) => {
+    let resolveToken, rejectToken;
+    const tokenPromise = new Promise((res, rej) => { resolveToken = res; rejectToken = rej; });
+
+    const server = http.createServer((req, res) => {
+      const reqUrl = new URL(req.url, 'http://127.0.0.1');
+
+      if (reqUrl.pathname === '/callback') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>MeetNote Sign In</title></head>
+<body style="font-family:system-ui;max-width:400px;margin:80px auto;text-align:center">
+<h2>Completing sign in...</h2>
+<script>
+fetch('/done', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ hash: location.hash, search: location.search })
+}).then(() => {
+  document.body.innerHTML = '<h2 style="color:#22c55e">&#10003; Authentication complete</h2><p>You can close this tab and return to MeetNote.</p>';
+}).catch(() => {
+  document.body.innerHTML = '<h2 style="color:#ef4444">Something went wrong</h2><p>Please try signing in again.</p>';
+});
+</script>
+</body></html>`);
+        return;
+      }
+
+      if (reqUrl.pathname === '/done' && req.method === 'POST') {
+        let body = '';
+        req.on('data', chunk => { body += chunk.toString(); });
+        req.on('end', () => {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end('{"ok":true}');
+          try { resolveToken(JSON.parse(body)); } catch { resolveToken({}); }
+        });
+        return;
+      }
+
+      res.writeHead(404);
+      res.end();
+    });
+
+    // Abort if the user never completes the OAuth flow
+    const timeout = setTimeout(() => {
+      rejectToken(new Error('OAuth timeout after 5 minutes'));
+      server.close();
+    }, 5 * 60 * 1000);
+    tokenPromise.finally(() => clearTimeout(timeout));
+
+    server.listen(0, '127.0.0.1', () => {
+      resolve({ port: server.address().port, server, tokenPromise });
+    });
+    server.on('error', reject);
+  });
+}
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -59,6 +120,10 @@ function createWindow() {
 
   const wc = win.webContents;
 
+  wc.once('did-finish-load', () => {
+    wc.executeJavaScript('Notification.requestPermission()').catch(() => {});
+  });
+
   wc.setWindowOpenHandler(({ url }) => {
     if (url.includes('calendar.google.com') || url.includes('outlook.')) {
       shell.openExternal(url);
@@ -69,14 +134,45 @@ function createWindow() {
   });
 
   wc.on('will-navigate', (event, url) => {
+    // Intercept Supabase OAuth — redirect_to is rewritten to our loopback server
+    // so the token comes back to us instead of a remote URL.
+    if (url.includes('supabase.co/auth/v1/authorize')) {
+      event.preventDefault();
+      (async () => {
+        try {
+          if (oauthServer) { oauthServer.close(); oauthServer = null; }
+
+          const { port, server, tokenPromise } = await startOAuthServer();
+          oauthServer = server;
+
+          const parsed = new URL(url);
+          parsed.searchParams.set('redirect_to', `http://127.0.0.1:${port}/callback`);
+          shell.openExternal(parsed.toString());
+
+          const { hash, search } = await tokenPromise;
+          const fragment = hash || search || '';
+          win.loadURL(`https://app.trymeetnote.com/dashboard${fragment}`);
+
+          oauthServer.close();
+          oauthServer = null;
+        } catch (err) {
+          console.error('[oauth]', err.message);
+        }
+      })();
+      return;
+    }
+
+    // Fallback: if Google somehow ends up in Electron, push it to the browser
     if (url.includes('accounts.google.com')) {
       event.preventDefault();
       shell.openExternal(url);
       return;
     }
+
     const allowed =
       url.includes('dpikisphgxwcysvvvltf.supabase.co') ||
       url.includes(NEXT_URL) ||
+      url.includes('app.trymeetnote.com') ||
       (url.startsWith('file://') && url.includes('frontend-build'));
     if (!allowed && url.startsWith('file://')) {
       event.preventDefault();
@@ -95,82 +191,68 @@ function createWindow() {
   });
 }
 
-// ── IPC: system audio sources (for renderer-side desktopCapturer use) ────────
-ipcMain.handle('get-desktop-sources', async () => {
-  const sources = await desktopCapturer.getSources({
-    types: ['screen', 'window'],
-    fetchWindowIcons: false,
-  });
-  return sources.map(({ id, name }) => ({ id, name }));
+// ── IPC: permissions (called by the frontend's onboarding modal) ──────────────
+ipcMain.handle('request-mic-permission', async () => {
+  if (process.platform !== 'darwin') return 'granted';
+  const ok = await systemPreferences.askForMediaAccess('microphone');
+  return ok ? 'granted' : 'denied';
 });
 
-// ── IPC: start native mic recording ──────────────────────────────────────────
-ipcMain.handle('start-recording', async () => {
-  if (process.platform === 'win32') return { error: 'USE_BROWSER_RECORDER' };
-
-  if (recorderInstance) {
-    recorderInstance.stop();
-    recorderInstance = null;
-    await new Promise(r => setTimeout(r, 500));
-  }
-
-  const filePath   = path.join(os.tmpdir(), `meetnote-${Date.now()}.wav`);
-  const fileStream = fs.createWriteStream(filePath);
-
-  const rec = recorder.record({
-    sampleRate: 16000,
-    channels:   1,
-    audioType:  'wav',
-    recorder:   path.join(__dirname, 'sox-recorder'), // full path: /opt/homebrew/bin/sox
-  });
-
-  const audioStream = rec.stream();
-  audioStream.on('error', err => console.error('[recording] stream error:', err));
-  audioStream.pipe(fileStream);
-
-  recorderInstance = rec;
-  activeRecording = { process: rec, fileStream, filePath };
-  return { ok: true };
+ipcMain.handle('open-screen-recording-settings', () => {
+  shell.openExternal(
+    'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture'
+  );
 });
 
-// ── IPC: stop recording, upload to backend, return result ─────────────────────
-ipcMain.handle('stop-recording', async (_event) => {
-  if (!activeRecording) return { error: 'No active recording' };
+ipcMain.handle('get-screen-recording-status', () => {
+  if (process.platform !== 'darwin') return 'granted';
+  return systemPreferences.getMediaAccessStatus('screen');
+});
 
-  const { process: rec, fileStream, filePath } = activeRecording;
-  activeRecording = null;
+// ── IPC: start recording — native ScreenCaptureKit bridge ────────────────────
+let currentRecordingPath = null;
 
-  recorderInstance = null;
-  rec.stop();
-
-  // Wait for the file stream to finish flushing before reading
-  await new Promise((resolve, reject) => {
-    fileStream.on('finish', resolve);
-    fileStream.on('error', reject);
-  });
-
-  let result;
+ipcMain.handle('start-recording', async (_event) => {
   try {
-    const fileBuffer = fs.readFileSync(filePath);
-    const formData   = new FormData();
+    currentRecordingPath = path.join(os.tmpdir(), `meetnote-${Date.now()}.wav`);
+    await nativeBridge.startRecording(currentRecordingPath);
+    return { ok: true };
+  } catch (err) {
+    console.error('[start-recording]', err.message);
+    return { error: err.message };
+  }
+});
+
+// ── IPC: stop recording, read WAV from disk, upload to backend ────────────────
+ipcMain.handle('stop-recording', async (_event, { userId } = {}) => {
+  const wavPath = currentRecordingPath;
+  currentRecordingPath = null;
+  try {
+    const finishedPath = await nativeBridge.stopRecording();
+    const fileBuffer   = fs.readFileSync(finishedPath);
+    const formData     = new FormData();
     formData.append('file', new Blob([fileBuffer], { type: 'audio/wav' }), 'recording.wav');
+    if (userId) formData.append('user_id', userId);
 
     const res = await fetch(BACKEND_URL, { method: 'POST', body: formData });
     if (!res.ok) throw new Error(`Backend returned ${res.status}`);
-    result = await res.json();
+    return await res.json();
+  } catch (err) {
+    console.error('[stop-recording]', err.message);
+    return { error: err.message };
   } finally {
-    fs.unlink(filePath, () => {}); // clean up temp file regardless of upload outcome
+    const p = wavPath || currentRecordingPath;
+    if (p) fs.unlink(p, () => {});
   }
-
-  return result;
 });
 
 // ── IPC: upload a file buffer sent from the renderer directly to backend ─────
 // Lets the Vercel frontend bypass its own upload limit by handing the raw bytes
 // to the main process, which posts them straight to Railway.
-ipcMain.handle('upload-file-buffer', async (_event, { buffer, filename, mimeType }) => {
+ipcMain.handle('upload-file-buffer', async (_event, { buffer, filename, mimeType, userId }) => {
   const formData = new FormData();
   formData.append('file', new Blob([buffer], { type: mimeType }), filename);
+  if (userId) formData.append('user_id', userId);
   const res = await fetch(BACKEND_URL, { method: 'POST', body: formData });
   if (!res.ok) throw new Error(`Backend returned ${res.status}`);
   return await res.json();
@@ -202,6 +284,10 @@ ipcMain.handle('pick-and-upload-file', async (event) => {
   const res = await fetch(BACKEND_URL, { method: 'POST', body: formData });
   if (!res.ok) throw new Error(`Backend returned ${res.status}`);
   return await res.json();
+});
+
+ipcMain.handle('open-notification-settings', () => {
+  shell.openExternal('x-apple.systempreferences:com.apple.preference.notifications');
 });
 
 // ── Meeting detection ─────────────────────────────────────────────────────────
@@ -236,14 +322,20 @@ function isMeetingRunning() {
     // Zoom — pgrep exits 0 if the process is found, throws otherwise
     try {
       execSync('pgrep -x "zoom.us"', { stdio: 'ignore' });
+      console.log('[isMeetingRunning] Zoom detected');
       return true;
-    } catch {}
+    } catch {
+      console.log('[isMeetingRunning] Zoom not running');
+    }
 
     // Google Meet in Chrome
     try {
       const out = execSync(`osascript "${MEET_SCRIPT_PATH}"`, { encoding: 'utf8' }).trim();
+      console.log('[isMeetingRunning] AppleScript result:', out);
       if (out === 'found') return true;
-    } catch {}
+    } catch (err) {
+      console.log('[isMeetingRunning] AppleScript error:', err.message);
+    }
 
     return false;
   } catch {
@@ -263,25 +355,34 @@ function focusMainWindow() {
 
 function checkAndNotify() {
   try {
-    // const running = isMeetingRunning(); // disabled until permissions are properly handled
+    console.log('[checkAndNotify] checking... meetingActive=%s hasNotified=%s', meetingActive, hasNotifiedForMeeting);
+    const running = isMeetingRunning();
+    console.log('[checkAndNotify] isMeetingRunning returned:', running);
 
     if (running && !meetingActive) {
       // Meeting just started
+      console.log('[checkAndNotify] meeting started');
       meetingActive         = true;
       hasNotifiedForMeeting = false;
     } else if (!running && meetingActive) {
       // Meeting just ended — reset so the next meeting triggers a new notification
+      console.log('[checkAndNotify] meeting ended — resetting state');
       meetingActive         = false;
       hasNotifiedForMeeting = false;
       return;
     }
 
     if (meetingActive && !hasNotifiedForMeeting) {
+      console.log('[checkAndNotify] sending notification');
       hasNotifiedForMeeting = true;
+      if (process.platform === 'darwin') app.dock.bounce('critical');
       const n = new Notification({
-        title:   'Meeting detected',
-        body:    'Meeting detected. Start recording in MeetNote?',
-        actions: [{ type: 'button', text: 'Open MeetNote' }],
+        title:    'Meeting detected',
+        subtitle: 'Tap to start recording',
+        body:     'A meeting is in progress. Start recording?',
+        sound:    'default',
+        urgency:  'critical',
+        actions:  [{ type: 'button', text: 'Open MeetNote' }],
       });
       n.on('click',  focusMainWindow);
       n.on('action', focusMainWindow);
@@ -298,12 +399,16 @@ app.commandLine.appendSwitch('disable-features', 'OutOfBlinkCors');
 app.commandLine.appendSwitch('no-sandbox');
 
 app.whenReady().then(async () => {
-  // Trigger macOS system permission dialog for microphone before first use
   if (process.platform === 'darwin') {
     await systemPreferences.askForMediaAccess('microphone');
   }
 
   createWindow();
+
+  if (Notification.isSupported()) {
+    new Notification({ title: 'MeetNote', body: 'Meeting detection is active.', silent: true }).show();
+  }
+
   detectionInterval = setInterval(checkAndNotify, 30_000);
 
   app.on('activate', () => {
@@ -313,12 +418,10 @@ app.whenReady().then(async () => {
 
 app.on('window-all-closed', () => {
   clearInterval(detectionInterval);
-  if (recorderInstance) {
-    recorderInstance.stop();
-    recorderInstance = null;
-  }
-  if (activeRecording) {
-    activeRecording = null;
+  nativeBridge.shutdown();
+  if (oauthServer) {
+    oauthServer.close();
+    oauthServer = null;
   }
   if (process.platform !== 'darwin') app.quit();
 });
