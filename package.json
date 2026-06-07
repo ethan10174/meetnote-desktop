@@ -5,7 +5,8 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "dist": "electron-builder --mac --publish never",
+    "build-native": "bash build-native.sh",
+    "dist": "npm run build-native && electron-builder --mac --publish never",
     "dist-win": "electron-builder --win"
   },
   "build": {
@@ -18,18 +19,16 @@
     "files": [
       "main.js",
       "preload.js",
-      "sox-recorder.js",
+      "native-bridge.js",
       "notarize.js",
       "entitlements.mac.plist",
-      "index.html",
-      "renderer.js",
       "package.json",
       "node_modules/**/*"
     ],
     "extraResources": [
       {
-        "from": "resources/sox",
-        "to": "sox"
+        "from": "resources/audio-recorder",
+        "to": "audio-recorder"
       }
     ],
     "mac": {

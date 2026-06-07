@@ -11,6 +11,8 @@ const os             = require('os');
 const { execSync }   = require('child_process');
 const http           = require('http');
 
+app.setName('MeetNote');
+
 const NEXT_URL    = 'https://meeting-frontend-ashy.vercel.app';
 const BACKEND_URL = 'https://meeting-backend-production-ca80.up.railway.app/upload';
 
