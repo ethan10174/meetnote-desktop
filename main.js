@@ -87,6 +87,8 @@ function createWindow() {
     autoHideMenuBar: true,
     title: 'MeetNote',
     icon: path.join(__dirname, 'icon.icns'),
+    titleBarStyle: 'hiddenInset',
+    backgroundColor: '#ffffff',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
