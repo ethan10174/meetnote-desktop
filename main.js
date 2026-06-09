@@ -297,56 +297,20 @@ ipcMain.handle('open-notification-settings', () => {
 ipcMain.handle('get-app-version', () => app.getVersion());
 
 // ── Meeting detection ─────────────────────────────────────────────────────────
-// AppleScript to check whether any Chrome tab has meet.google.com open.
-// Written once to a stable tmp path so it isn't recreated on every check.
-const MEET_SCRIPT_PATH = path.join(os.tmpdir(), 'mn-meet-check.applescript');
-try {
-  fs.writeFileSync(MEET_SCRIPT_PATH, `\
-tell application "System Events"
-  if (name of processes) contains "Google Chrome" then
-    tell application "Google Chrome"
-      repeat with w in windows
-        repeat with t in tabs of w
-          if URL of t contains "meet.google.com" then
-            return "found"
-          end if
-        end repeat
-      end repeat
-    end tell
-  end if
-end tell
-return "not found"
-`);
-} catch {};
-
 let meetingActive        = false; // is a meeting currently detected?
 let hasNotifiedForMeeting = false; // have we shown the notification for this meeting?
 let detectionInterval    = null;
 
 function isMeetingRunning() {
-  try {
-    // Zoom — pgrep exits 0 if the process is found, throws otherwise
+  const apps = ['zoom.us', 'Microsoft Teams'];
+  for (const app of apps) {
     try {
-      execSync('pgrep -x "zoom.us"', { stdio: 'ignore' });
-      console.log('[isMeetingRunning] Zoom detected');
+      execSync(`pgrep -x "${app}"`, { stdio: 'ignore' });
+      console.log('[isMeetingRunning] detected:', app);
       return true;
-    } catch {
-      console.log('[isMeetingRunning] Zoom not running');
-    }
-
-    // Google Meet in Chrome
-    try {
-      const out = execSync(`osascript "${MEET_SCRIPT_PATH}"`, { encoding: 'utf8' }).trim();
-      console.log('[isMeetingRunning] AppleScript result:', out);
-      if (out === 'found') return true;
-    } catch (err) {
-      console.log('[isMeetingRunning] AppleScript error:', err.message);
-    }
-
-    return false;
-  } catch {
-    return false;
+    } catch {}
   }
+  return false;
 }
 
 function focusMainWindow() {
