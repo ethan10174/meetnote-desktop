@@ -294,6 +294,8 @@ ipcMain.handle('open-notification-settings', () => {
   shell.openExternal('x-apple.systempreferences:com.apple.preference.notifications');
 });
 
+ipcMain.handle('get-app-version', () => app.getVersion());
+
 // ── Meeting detection ─────────────────────────────────────────────────────────
 // AppleScript to check whether any Chrome tab has meet.google.com open.
 // Written once to a stable tmp path so it isn't recreated on every check.

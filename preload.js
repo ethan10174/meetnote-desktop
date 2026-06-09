@@ -20,4 +20,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
   requestMicPermission: () => ipcRenderer.invoke('request-mic-permission'),
   openScreenRecordingSettings: () => ipcRenderer.invoke('open-screen-recording-settings'),
   getScreenRecordingStatus: () => ipcRenderer.invoke('get-screen-recording-status'),
+
+  getAppVersion: () => ipcRenderer.invoke('get-app-version'),
 });

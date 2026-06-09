@@ -20,7 +20,7 @@ import CoreMedia
 
 // MARK: - Constants
 
-let SAMPLE_RATE: Double = 48000
+let SAMPLE_RATE: Double = 44100
 let CHANNELS: Int = 2
 
 // MARK: - I/O helpers
@@ -104,9 +104,18 @@ final class Recorder: NSObject {
         }
         closeSysHandleSync()
 
+        // Diagnostic: log raw capture sizes so we can tell whether audio arrived.
+        // sysBytes == 0 means SCStream delivered no audio frames (permission or
+        // filter problem). micBytes == 0 means AVAudioEngine tap got nothing.
+        let sysBytes = (try? FileManager.default.attributesOfItem(atPath: sysPath)[.size] as? Int) ?? 0
+        let micBytes = (try? FileManager.default.attributesOfItem(atPath: micPath)[.size] as? Int) ?? 0
+        log("[recorder] raw capture — sys: \(sysBytes) bytes, mic: \(micBytes) bytes")
+
         // Mix and write WAV
         do {
             try mix(to: outputPath)
+            let wavBytes = (try? FileManager.default.attributesOfItem(atPath: outputPath)[.size] as? Int) ?? 0
+            log("[recorder] WAV written: \(wavBytes) bytes → \(outputPath)")
             emit(["status": "stopped", "path": outputPath])
         } catch {
             emit(["status": "error", "message": "WAV write failed: \(error.localizedDescription)"])
