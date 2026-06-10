@@ -34,17 +34,13 @@ function startOAuthServer() {
         res.end(`<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>MeetNote Sign In</title></head>
 <body style="font-family:system-ui;max-width:400px;margin:80px auto;text-align:center">
-<h2>Completing sign in...</h2>
+<p style="color:#6b7280">Authentication complete, you can close this tab.</p>
 <script>
 fetch('/done', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({ hash: location.hash, search: location.search })
-}).then(() => {
-  document.body.innerHTML = '<h2 style="color:#22c55e">&#10003; Authentication complete</h2><p>You can close this tab and return to MeetNote.</p>';
-}).catch(() => {
-  document.body.innerHTML = '<h2 style="color:#ef4444">Something went wrong</h2><p>Please try signing in again.</p>';
-});
+}).finally(() => { window.close(); });
 </script>
 </body></html>`);
         return;
