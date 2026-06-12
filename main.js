@@ -219,6 +219,10 @@ ipcMain.handle('start-recording', async (_event) => {
     return { ok: true };
   } catch (err) {
     console.error('[start-recording]', err.message);
+    if (err.code === 'FFMPEG_UNAVAILABLE') {
+      currentRecordingPath = null;
+      return { fallbackToBrowser: true };
+    }
     return { error: err.message };
   }
 });
@@ -227,6 +231,8 @@ ipcMain.handle('start-recording', async (_event) => {
 ipcMain.handle('stop-recording', async (_event, { userId } = {}) => {
   const wavPath = currentRecordingPath;
   currentRecordingPath = null;
+  // No native recording active — renderer is using browser MediaRecorder fallback
+  if (!wavPath) return { fallbackToBrowser: true };
   try {
     const finishedPath = await nativeBridge.stopRecording();
     const fileBuffer   = fs.readFileSync(finishedPath);
