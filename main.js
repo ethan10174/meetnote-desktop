@@ -76,6 +76,7 @@ fetch('/done', {
 }
 
 function createWindow() {
+  const isWin = process.platform === 'win32';
   const win = new BrowserWindow({
     width: 1200,
     height: 800,
@@ -83,8 +84,11 @@ function createWindow() {
     autoHideMenuBar: true,
     title: 'MeetNote',
     icon: path.join(__dirname, 'icon.icns'),
-    titleBarStyle: 'hiddenInset',
     backgroundColor: '#ffffff',
+    titleBarStyle: isWin ? 'hidden' : 'hiddenInset',
+    ...(isWin && {
+      titleBarOverlay: { color: '#ffffff', symbolColor: '#000000' },
+    }),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -233,23 +237,36 @@ ipcMain.handle('stop-recording', async (_event, { userId } = {}) => {
   currentRecordingPath = null;
   // No native recording active — renderer is using browser MediaRecorder fallback
   if (!wavPath) return { fallbackToBrowser: true };
+
+  let finishedPath = null;
   try {
-    const finishedPath = await nativeBridge.stopRecording();
-    const fileBuffer   = fs.readFileSync(finishedPath);
-    const formData     = new FormData();
+    finishedPath = await nativeBridge.stopRecording();
+    console.log('[stop-recording] finishedPath:', finishedPath);
+    const fileBuffer = fs.readFileSync(finishedPath);
+    const formData   = new FormData();
     formData.append('file', new Blob([fileBuffer], { type: 'audio/wav' }), 'recording.wav');
     if (userId) formData.append('user_id', userId);
 
     const res = await fetch(BACKEND_URL, { method: 'POST', body: formData });
     if (!res.ok) throw new Error(`Backend returned ${res.status}`);
-    return await res.json();
+    const result = await res.json();
+    console.log('[stop-recording] upload succeeded, result keys:', Object.keys(result));
+    fs.unlink(finishedPath, () => {});
+    fs.unlink(wavPath, () => {});
+    return result;
   } catch (err) {
-    console.error('[stop-recording]', err.message);
-    return { error: err.message };
-  } finally {
-    const p = wavPath || currentRecordingPath;
-    if (p) fs.unlink(p, () => {});
+    console.error('[stop-recording] upload failed:', err.message);
+    // Return the finished path so the renderer can retry via upload-file-buffer
+    return { audioPath: finishedPath || wavPath, uploadError: err.message };
   }
+});
+
+// ── IPC: read a local file and return its bytes to the renderer ───────────────
+ipcMain.handle('read-file-buffer', async (_event, filePath) => {
+  const buf = fs.readFileSync(filePath);
+  // Clean up after handing the bytes to the renderer
+  fs.unlink(filePath, () => {});
+  return buf;
 });
 
 // ── IPC: upload a file buffer sent from the renderer directly to backend ─────

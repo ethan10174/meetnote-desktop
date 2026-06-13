@@ -22,4 +22,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getScreenRecordingStatus: () => ipcRenderer.invoke('get-screen-recording-status'),
 
   getAppVersion: () => ipcRenderer.invoke('get-app-version'),
+
+  readFileBuffer: (filePath) => ipcRenderer.invoke('read-file-buffer', filePath),
 });
