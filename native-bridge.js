@@ -105,24 +105,25 @@ class WinBridge {
     this._outputPath = null;
   }
 
-  // Locate ffmpeg: bundled binary first, then PATH, then common install locations.
+  // Locate ffmpeg: resources folder first (packaged), then node_modules (dev), then PATH.
   _ffmpegBin() {
-    // Prefer the binary bundled via ffmpeg-static (unpacked from asar by electron-builder).
+    // 1. Packaged app: electron-builder copies ffmpeg.exe into the resources folder.
+    if (process.resourcesPath) {
+      const resourcesBin = path.join(process.resourcesPath, 'ffmpeg.exe');
+      if (fs.existsSync(resourcesBin)) return resourcesBin;
+    }
+    // 2. Dev mode: use the binary that ffmpeg-static installed into node_modules.
     try {
       const bundled = require('ffmpeg-static');
       if (bundled && fs.existsSync(bundled)) return bundled;
     } catch {}
-    // Fall back to a user-installed ffmpeg on PATH or well-known locations.
+    // 3. User-installed ffmpeg on PATH or well-known locations.
     const { execSync } = require('child_process');
     try {
       return execSync('where ffmpeg', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
         .split(/\r?\n/)[0].trim();
     } catch {}
-    for (const loc of [
-      'C:\\ffmpeg\\bin\\ffmpeg.exe',
-      path.join(__dirname, 'ffmpeg.exe'),
-      ...(process.resourcesPath ? [path.join(process.resourcesPath, 'ffmpeg.exe')] : []),
-    ]) {
+    for (const loc of ['C:\\ffmpeg\\bin\\ffmpeg.exe', path.join(__dirname, 'ffmpeg.exe')]) {
       if (fs.existsSync(loc)) return loc;
     }
     return null;

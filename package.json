@@ -25,9 +25,6 @@
       "package.json",
       "node_modules/**/*"
     ],
-    "asarUnpack": [
-      "node_modules/ffmpeg-static/**"
-    ],
     "extraResources": [
       {
         "from": "resources/audio-recorder",
@@ -35,6 +32,9 @@
       }
     ],
     "mac": {
+      "extraResources": [
+        { "from": "node_modules/ffmpeg-static/ffmpeg", "to": "ffmpeg" }
+      ],
       "identity": "ETHAN ALLISON (GMVTGR644V)",
       "hardenedRuntime": true,
       "gatekeeperAssess": false,
@@ -53,6 +53,9 @@
       "category": "public.app-category.productivity"
     },
     "win": {
+      "extraResources": [
+        { "from": "node_modules/ffmpeg-static/ffmpeg.exe", "to": "ffmpeg.exe" }
+      ],
       "target": [
         {
           "target": "nsis",
