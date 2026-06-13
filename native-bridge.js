@@ -105,8 +105,14 @@ class WinBridge {
     this._outputPath = null;
   }
 
-  // Locate ffmpeg: PATH first, then common install locations.
+  // Locate ffmpeg: bundled binary first, then PATH, then common install locations.
   _ffmpegBin() {
+    // Prefer the binary bundled via ffmpeg-static (unpacked from asar by electron-builder).
+    try {
+      const bundled = require('ffmpeg-static');
+      if (bundled && fs.existsSync(bundled)) return bundled;
+    } catch {}
+    // Fall back to a user-installed ffmpeg on PATH or well-known locations.
     const { execSync } = require('child_process');
     try {
       return execSync('where ffmpeg', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
