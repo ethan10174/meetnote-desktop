@@ -190,6 +190,7 @@ class WinBridge {
     }
 
     this._outputPath = outputPath;
+    console.log(`[win-bridge] spawning: ${bin} ${args.join(' ')}`);
     this._proc = spawn(bin, args, { stdio: ['pipe', 'ignore', 'pipe'] });
 
     return new Promise((resolve, reject) => {
@@ -225,15 +226,25 @@ class WinBridge {
     if (!this._proc) throw new Error('No active ffmpeg process');
     const outputPath = this._outputPath;
 
-    return new Promise(resolve => {
-      this._proc.once('exit', () => resolve(outputPath));
+    await new Promise(resolve => {
+      this._proc.once('exit', resolve);
 
       // Graceful stop: send 'q' to stdin (same as pressing Q in the terminal)
       try { this._proc.stdin.write('q\n'); this._proc.stdin.end(); } catch {}
 
       // Hard-kill fallback after 10 s
-      setTimeout(() => { try { this._proc?.kill(); } catch {} resolve(outputPath); }, 10_000);
+      setTimeout(() => { try { this._proc?.kill(); } catch {} resolve(); }, 10_000);
     });
+
+    // Validate the output file before returning the path.
+    let fileSize = 0;
+    try { fileSize = fs.statSync(outputPath).size; } catch {}
+    console.log(`[win-bridge] recording stopped — output: ${outputPath} (${fileSize} bytes)`);
+    if (fileSize === 0) {
+      throw new Error(`ffmpeg produced an empty file (0 bytes) at ${outputPath}. Check ffmpeg stderr above for the cause.`);
+    }
+
+    return outputPath;
   }
 
   shutdown() {
