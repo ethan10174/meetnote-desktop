@@ -138,11 +138,13 @@ class WinBridge {
       let out = '';
       p.stderr.on('data', d => { out += d.toString(); });
       p.on('close', () => {
+        process.stderr.write('[win-bridge] DirectShow device list:\n' + out + '\n');
         const devices = [];
         // ffmpeg prints: "Device Name" (audio)
         const re = /"([^"]+)"\s*\(audio\)/g;
         let m;
         while ((m = re.exec(out)) !== null) devices.push(m[1]);
+        console.log('[win-bridge] parsed audio devices:', devices);
         resolve(devices);
       });
     });
@@ -156,6 +158,18 @@ class WinBridge {
       );
       e.code = 'FFMPEG_UNAVAILABLE';
       throw e;
+    }
+
+    // Synchronously dump every DirectShow device so we can see what Windows reports.
+    try {
+      const { execSync } = require('child_process');
+      execSync(`"${bin}" -list_devices true -f dshow -i dummy`, {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (e) {
+      // ffmpeg always exits non-zero for -i dummy; the device list is on stderr.
+      console.error('[win-bridge] devices:', e.stderr || e.stdout || e.message);
     }
 
     const devices = await this._listDShowDevices(bin);
