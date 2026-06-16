@@ -217,16 +217,20 @@ ipcMain.handle('get-screen-recording-status', () => {
 let currentRecordingPath = null;
 
 ipcMain.handle('start-recording', async (_event) => {
+  console.log('[main] start-recording received');
   try {
     currentRecordingPath = path.join(os.tmpdir(), `meetnote-${Date.now()}.wav`);
     await nativeBridge.startRecording(currentRecordingPath);
+    console.log('[main] start-recording complete — ok');
     return { ok: true };
   } catch (err) {
     console.error('[start-recording]', err.message);
     if (err.code === 'FFMPEG_UNAVAILABLE') {
       currentRecordingPath = null;
+      console.log('[main] start-recording complete — fallbackToBrowser');
       return { fallbackToBrowser: true };
     }
+    console.log('[main] start-recording complete — error:', err.message);
     return { error: err.message };
   }
 });
