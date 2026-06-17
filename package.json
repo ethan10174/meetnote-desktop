@@ -54,7 +54,8 @@
     },
     "win": {
       "extraResources": [
-        { "from": "node_modules/ffmpeg-static/ffmpeg.exe", "to": "ffmpeg.exe" }
+        { "from": "node_modules/ffmpeg-static/ffmpeg.exe", "to": "ffmpeg.exe" },
+        { "from": "native/audio_capture.exe", "to": "audio_capture.exe" }
       ],
       "target": [
         {

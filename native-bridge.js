@@ -2,10 +2,10 @@
 // Platform-aware audio recorder bridge.
 //
 // macOS  → spawns the Swift audio-recorder helper (ScreenCaptureKit + AVAudioEngine)
-// Windows → spawns ffmpeg with DirectShow inputs:
-//             • Stereo Mix present: system audio + mic, mixed via amix
-//             • No Stereo Mix:      mic only via dshow
-//             • ffmpeg not found:   throws err.code = 'FFMPEG_UNAVAILABLE'
+// Windows → spawns audio_capture.exe (WASAPI loopback) piped into ffmpeg:
+//             • Mic found via DirectShow: system audio + mic mixed via amix
+//             • No mic found:             system audio (WASAPI loopback) only
+//             • audio_capture.exe missing or ffmpeg missing: throws err.code = 'FFMPEG_UNAVAILABLE'
 //               so main.js can signal the renderer to use browser MediaRecorder
 //
 // Both bridges expose the same three methods:
@@ -97,27 +97,40 @@ class MacBridge extends EventEmitter {
   }
 }
 
-// ── Windows bridge (ffmpeg + DirectShow) ─────────────────────────────────────
+// ── Windows bridge (audio_capture.exe WASAPI loopback + ffmpeg WAV mux) ──────
+//
+// audio_capture.exe (WASAPI loopback) → raw PCM stdout
+//   → piped into ffmpeg stdin as s16le 44100 2ch (system audio)
+//   + ffmpeg DirectShow mic input (best-effort; omitted if no mic found)
+//   → WAV file on disk
+//
+// Stopping: kill audio_capture → its stdout EOF propagates to ffmpeg stdin →
+// ffmpeg finalises the WAV header and exits cleanly.
 
 class WinBridge {
   constructor() {
-    this._proc       = null;
-    this._outputPath = null;
+    this._captureProc = null;   // audio_capture.exe
+    this._ffmpegProc  = null;   // ffmpeg
+    this._outputPath  = null;
   }
 
-  // Locate ffmpeg: resources folder first (packaged), then node_modules (dev), then PATH.
+  // Locate audio_capture.exe: resources folder (packaged) or native/ subdir (dev).
+  _captureBin() {
+    const { app } = require('electron');
+    if (app.isPackaged) return path.join(process.resourcesPath, 'audio_capture.exe');
+    return path.join(__dirname, 'native', 'audio_capture.exe');
+  }
+
+  // Locate ffmpeg: resources folder first (packaged), then ffmpeg-static (dev), then PATH.
   _ffmpegBin() {
-    // 1. Packaged app: electron-builder copies ffmpeg.exe into the resources folder.
     if (process.resourcesPath) {
-      const resourcesBin = path.join(process.resourcesPath, 'ffmpeg.exe');
-      if (fs.existsSync(resourcesBin)) return resourcesBin;
+      const p = path.join(process.resourcesPath, 'ffmpeg.exe');
+      if (fs.existsSync(p)) return p;
     }
-    // 2. Dev mode: use the binary that ffmpeg-static installed into node_modules.
     try {
       const bundled = require('ffmpeg-static');
       if (bundled && fs.existsSync(bundled)) return bundled;
     } catch {}
-    // 3. User-installed ffmpeg on PATH or well-known locations.
     const { execSync } = require('child_process');
     try {
       return execSync('where ffmpeg', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
@@ -129,141 +142,143 @@ class WinBridge {
     return null;
   }
 
-  // List available DirectShow audio device names.
-  _listDShowDevices(bin) {
+  // Return the name of the first real microphone found via DirectShow, or null.
+  _findDefaultMic(ffmpegBin) {
     return new Promise(resolve => {
-      const p = spawn(bin, ['-f', 'dshow', '-list_devices', 'true', '-i', 'dummy'], {
+      const p = spawn(ffmpegBin, ['-f', 'dshow', '-list_devices', 'true', '-i', 'dummy'], {
         stdio: ['ignore', 'ignore', 'pipe'],
       });
       let out = '';
       p.stderr.on('data', d => { out += d.toString(); });
       p.on('close', () => {
-        process.stderr.write('[win-bridge] DirectShow device list:\n' + out + '\n');
         const devices = [];
-        // ffmpeg prints: "Device Name" (audio)
         const re = /"([^"]+)"\s*\(audio\)/g;
         let m;
         while ((m = re.exec(out)) !== null) devices.push(m[1]);
-        console.log('[win-bridge] parsed audio devices:', devices);
-        resolve(devices);
+        const mic = devices.find(d => !/stereo mix|wave out mix|what u hear/i.test(d)) ?? null;
+        console.log('[win-bridge] DirectShow audio devices:', devices, '→ mic:', mic ?? '(none)');
+        resolve(mic);
       });
     });
   }
 
   async startRecording(outputPath) {
-    const bin = this._ffmpegBin();
-    if (!bin) {
-      const e = new Error(
-        'ffmpeg not found. Install ffmpeg and add it to PATH to enable system audio capture on Windows.'
-      );
+    const captureBin = this._captureBin();
+    if (!fs.existsSync(captureBin)) {
+      const e = new Error(`audio_capture.exe not found at ${captureBin}`);
       e.code = 'FFMPEG_UNAVAILABLE';
       throw e;
     }
 
-    // Synchronously dump every DirectShow device so we can see what Windows reports.
-    try {
-      const { execSync } = require('child_process');
-      execSync(`"${bin}" -list_devices true -f dshow -i dummy`, {
-        encoding: 'utf8',
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-    } catch (e) {
-      // ffmpeg always exits non-zero for -i dummy; the device list is on stderr.
-      console.error('[win-bridge] devices:', e.stderr || e.stdout || e.message);
-    }
-
-    const devices = await this._listDShowDevices(bin);
-    if (!devices.length) {
-      const e = new Error('No DirectShow audio devices found.');
+    const ffmpegBin = this._ffmpegBin();
+    if (!ffmpegBin) {
+      const e = new Error('ffmpeg not found. Install ffmpeg and add it to PATH.');
       e.code = 'FFMPEG_UNAVAILABLE';
       throw e;
     }
 
-    // Identify Stereo Mix (system audio loopback) and a microphone device.
-    const stereoMix = devices.find(d => /stereo mix|wave out mix|what u hear/i.test(d));
-    const mic       = devices.find(d => !/stereo mix|wave out mix|what u hear/i.test(d));
+    this._outputPath = outputPath;
 
-    let args;
-    if (stereoMix && mic) {
-      console.log(`[win-bridge] system audio (${stereoMix}) + mic (${mic})`);
-      args = [
-        '-f', 'dshow', '-i', `audio=${stereoMix}`,
+    // Enumerate mic devices (best-effort; null → system audio only).
+    const mic = await this._findDefaultMic(ffmpegBin);
+
+    // Spawn audio_capture.exe — its stdout is raw PCM s16le 44100 2ch.
+    this._captureProc = spawn(captureBin, [
+      '--sample-rate', '44100', '--channels', '2', '--bit-depth', '16',
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    this._captureProc.stderr.on('data', d => process.stderr.write('[audio_capture] ' + d));
+
+    // Build ffmpeg input args: pipe:0 = system audio (WASAPI loopback via stdin).
+    let ffmpegArgs;
+    if (mic) {
+      console.log(`[win-bridge] WASAPI loopback + mic (${mic})`);
+      ffmpegArgs = [
+        '-f', 's16le', '-ar', '44100', '-ac', '2', '-i', 'pipe:0',
         '-f', 'dshow', '-i', `audio=${mic}`,
-        '-filter_complex', 'amix=inputs=2:duration=longest',
+        '-filter_complex', 'amix=inputs=2:duration=first',
         '-acodec', 'pcm_s16le', '-ar', '44100', '-ac', '2',
         '-y', outputPath,
       ];
     } else {
-      const dev = mic || devices[0];
-      console.log(`[win-bridge] mic only (${dev}) — Stereo Mix not found`);
-      args = [
-        '-f', 'dshow', '-i', `audio=${dev}`,
+      console.log('[win-bridge] WASAPI loopback only (no mic found)');
+      ffmpegArgs = [
+        '-f', 's16le', '-ar', '44100', '-ac', '2', '-i', 'pipe:0',
         '-acodec', 'pcm_s16le', '-ar', '44100', '-ac', '2',
         '-y', outputPath,
       ];
     }
 
-    this._outputPath = outputPath;
-    console.log(`[win-bridge] spawning: ${bin} ${args.join(' ')}`);
-    this._proc = spawn(bin, args, { stdio: ['pipe', 'ignore', 'pipe'] });
+    console.log(`[win-bridge] ffmpeg args: ${ffmpegArgs.join(' ')}`);
+    this._ffmpegProc = spawn(ffmpegBin, ffmpegArgs, { stdio: ['pipe', 'ignore', 'pipe'] });
+
+    // Wire WASAPI PCM → ffmpeg stdin.
+    this._captureProc.stdout.pipe(this._ffmpegProc.stdin);
 
     return new Promise((resolve, reject) => {
       let resolved = false;
 
-      this._proc.stderr.on('data', d => {
+      this._ffmpegProc.stderr.on('data', d => {
         const text = d.toString();
         process.stderr.write('[ffmpeg] ' + text);
-        // ffmpeg prints "Press [q] to stop" once it's actively recording
         if (!resolved && /Press \[q\]|size=\s*\d+kB/i.test(text)) {
           resolved = true; resolve();
         }
       });
 
-      this._proc.on('error', err => {
+      this._captureProc.on('error', err => {
         if (!resolved) { resolved = true; reject(err); }
       });
-
-      this._proc.on('exit', (code, sig) => {
-        this._proc = null;
+      this._ffmpegProc.on('error', err => {
+        if (!resolved) { resolved = true; reject(err); }
+      });
+      this._ffmpegProc.on('exit', (code, sig) => {
+        this._ffmpegProc = null;
         if (!resolved) {
           resolved = true;
           reject(new Error(`ffmpeg exited before recording started (code=${code}, signal=${sig})`));
         }
       });
 
-      // Resolve after 8 s regardless — some ffmpeg builds don't print the ready line
+      // Resolve after 8 s regardless — some builds don't print the ready line.
       setTimeout(() => { if (!resolved) { resolved = true; resolve(); } }, 8_000);
     });
   }
 
   async stopRecording() {
-    if (!this._proc) throw new Error('No active ffmpeg process');
+    if (!this._captureProc && !this._ffmpegProc) throw new Error('No active recording');
     const outputPath = this._outputPath;
 
     await new Promise(resolve => {
-      this._proc.once('exit', resolve);
+      if (this._ffmpegProc) {
+        this._ffmpegProc.once('exit', () => { this._ffmpegProc = null; resolve(); });
+      } else {
+        resolve();
+      }
 
-      // Graceful stop: send 'q' to stdin (same as pressing Q in the terminal)
-      try { this._proc.stdin.write('q\n'); this._proc.stdin.end(); } catch {}
+      // Killing audio_capture closes its stdout; propagate EOF to ffmpeg stdin so
+      // ffmpeg writes the WAV trailer and exits cleanly.
+      try { this._captureProc?.kill(); } catch {}
+      this._captureProc = null;
+      try { this._ffmpegProc?.stdin?.end(); } catch {}
 
-      // Hard-kill fallback after 10 s
-      setTimeout(() => { try { this._proc?.kill(); } catch {} resolve(); }, 10_000);
+      // Hard-kill fallback after 10 s.
+      setTimeout(() => { try { this._ffmpegProc?.kill(); } catch {} resolve(); }, 10_000);
     });
 
-    // Validate the output file before returning the path.
     let fileSize = 0;
     try { fileSize = fs.statSync(outputPath).size; } catch {}
     console.log(`[win-bridge] recording stopped — output: ${outputPath} (${fileSize} bytes)`);
     if (fileSize === 0) {
-      throw new Error(`ffmpeg produced an empty file (0 bytes) at ${outputPath}. Check ffmpeg stderr above for the cause.`);
+      throw new Error(`Recording produced an empty file at ${outputPath}. Check stderr above for details.`);
     }
-
     return outputPath;
   }
 
   shutdown() {
-    try { this._proc?.kill(); } catch {}
-    this._proc = null;
+    try { this._captureProc?.kill(); } catch {}
+    try { this._ffmpegProc?.kill(); } catch {}
+    this._captureProc = null;
+    this._ffmpegProc  = null;
   }
 }
 
