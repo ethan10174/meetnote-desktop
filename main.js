@@ -18,6 +18,41 @@ const BACKEND_URL = 'https://meeting-backend-production-ca80.up.railway.app/uplo
 
 let oauthServer = null; // loopback HTTP server used during OAuth
 
+// ── Chunk upload helper ───────────────────────────────────────────────────────
+// Posts a single WAV chunk to the backend with chunk metadata as query params.
+// Deletes the local file after a successful upload.
+async function uploadChunk(filePath, chunkIndex, meetingId, isFinal, userId) {
+  const url = new URL(BACKEND_URL);
+  url.searchParams.set('chunk',       'true');
+  url.searchParams.set('chunk_index', String(chunkIndex));
+  url.searchParams.set('meeting_id',  meetingId);
+  if (isFinal) url.searchParams.set('final', 'true');
+
+  const fileBuffer = fs.readFileSync(filePath);
+  const formData   = new FormData();
+  formData.append('file', new Blob([fileBuffer], { type: 'audio/wav' }), `chunk-${chunkIndex}.wav`);
+  if (userId) formData.append('user_id', userId);
+
+  const res = await fetch(url.toString(), { method: 'POST', body: formData });
+  if (!res.ok) throw new Error(`Backend returned ${res.status}`);
+  const result = await res.json();
+  fs.unlink(filePath, () => {});
+  return result;
+}
+
+// Wire up the chunk-ready event once (fires every 10 min during recording).
+// nativeBridge is an EventEmitter on mac/win; Linux stub has no .on.
+if (typeof nativeBridge.on === 'function') {
+  nativeBridge.on('chunk-ready', ({ path: chunkPath, index }) => {
+    // Capture meetingId synchronously — stop-recording may clear it later.
+    const meetingId = currentMeetingId;
+    console.log(`[main] chunk-ready: index=${index} path=${chunkPath}`);
+    uploadChunk(chunkPath, index, meetingId, false, null)
+      .then(r  => console.log(`[main] chunk ${index} uploaded:`, Object.keys(r)))
+      .catch(err => console.error(`[main] chunk ${index} upload failed:`, err.message));
+  });
+}
+
 // Starts a temporary HTTP server on a random port.
 // Returns { port, server, tokenPromise } where tokenPromise resolves with
 // { hash, search } once the browser posts back the OAuth callback fragment.
@@ -213,55 +248,57 @@ ipcMain.handle('get-screen-recording-status', () => {
   return systemPreferences.getMediaAccessStatus('screen');
 });
 
-// ── IPC: start recording — native ScreenCaptureKit bridge ────────────────────
-let currentRecordingPath = null;
+// ── IPC: start recording — chunked native bridge ─────────────────────────────
+let currentRecordingDir = null;
+let currentMeetingId    = null;
 
 ipcMain.handle('start-recording', async (_event) => {
   console.log('[main] start-recording received');
   try {
-    currentRecordingPath = path.join(os.tmpdir(), `meetnote-${Date.now()}.wav`);
-    await nativeBridge.startRecording(currentRecordingPath);
-    console.log('[main] start-recording complete — ok');
+    currentMeetingId    = `meeting-${Date.now()}`;
+    currentRecordingDir = path.join(os.tmpdir(), currentMeetingId);
+    fs.mkdirSync(currentRecordingDir, { recursive: true });
+    await nativeBridge.startRecording(currentRecordingDir);
+    console.log('[main] start-recording complete — ok, meetingId:', currentMeetingId);
     return { ok: true };
   } catch (err) {
     console.error('[start-recording]', err.message);
+    if (currentRecordingDir) {
+      fs.rm(currentRecordingDir, { recursive: true, force: true }, () => {});
+    }
+    currentRecordingDir = null;
+    currentMeetingId    = null;
     if (err.code === 'FFMPEG_UNAVAILABLE') {
-      currentRecordingPath = null;
       console.log('[main] start-recording complete — fallbackToBrowser');
       return { fallbackToBrowser: true };
     }
-    console.log('[main] start-recording complete — error:', err.message);
     return { error: err.message };
   }
 });
 
-// ── IPC: stop recording, read WAV from disk, upload to backend ────────────────
+// ── IPC: stop recording — finalize last chunk and upload as final ─────────────
 ipcMain.handle('stop-recording', async (_event, { userId } = {}) => {
-  const wavPath = currentRecordingPath;
-  currentRecordingPath = null;
-  // No native recording active — renderer is using browser MediaRecorder fallback
-  if (!wavPath) return { fallbackToBrowser: true };
+  const recordingDir = currentRecordingDir;
+  const meetingId    = currentMeetingId;
+  currentRecordingDir = null;
+  currentMeetingId    = null;
 
-  let finishedPath = null;
+  // No native recording active — renderer is using browser MediaRecorder fallback.
+  if (!recordingDir) return { fallbackToBrowser: true };
+
+  let finalPath = null;
   try {
-    finishedPath = await nativeBridge.stopRecording();
-    console.log('[stop-recording] finishedPath:', finishedPath);
-    const fileBuffer = fs.readFileSync(finishedPath);
-    const formData   = new FormData();
-    formData.append('file', new Blob([fileBuffer], { type: 'audio/wav' }), 'recording.wav');
-    if (userId) formData.append('user_id', userId);
+    const { path: p, index } = await nativeBridge.stopRecording();
+    finalPath = p;
+    console.log(`[stop-recording] final chunk ${index}:`, finalPath);
 
-    const res = await fetch(BACKEND_URL, { method: 'POST', body: formData });
-    if (!res.ok) throw new Error(`Backend returned ${res.status}`);
-    const result = await res.json();
-    console.log('[stop-recording] upload succeeded, result keys:', Object.keys(result));
-    fs.unlink(finishedPath, () => {});
-    fs.unlink(wavPath, () => {});
+    const result = await uploadChunk(finalPath, index, meetingId, true, userId);
+    console.log('[stop-recording] final chunk uploaded, result keys:', Object.keys(result));
+    fs.rm(recordingDir, { recursive: true, force: true }, () => {});
     return result;
   } catch (err) {
-    console.error('[stop-recording] upload failed:', err.message);
-    // Return the finished path so the renderer can retry via upload-file-buffer
-    return { audioPath: finishedPath || wavPath, uploadError: err.message };
+    console.error('[stop-recording] failed:', err.message);
+    return { audioPath: finalPath, uploadError: err.message };
   }
 });
 

@@ -8,10 +8,11 @@
 //             • audio_capture.exe missing or ffmpeg missing: throws err.code = 'FFMPEG_UNAVAILABLE'
 //               so main.js can signal the renderer to use browser MediaRecorder
 //
-// Both bridges expose the same three methods:
-//   startRecording(outputPath) → Promise<void>
-//   stopRecording()            → Promise<string>   (resolves with output file path)
-//   shutdown()                 → void
+// Both bridges expose the same interface:
+//   startRecording(chunkDir)  → Promise<void>   starts recording; emits 'chunk-ready' every 10 min
+//   stopRecording()           → Promise<{path, index}>   finalizes the last partial chunk
+//   shutdown()                → void
+//   Event 'chunk-ready'       → { path: string, index: number }
 
 const { spawn }    = require('child_process');
 const path         = require('path');
@@ -19,19 +20,29 @@ const readline     = require('readline');
 const fs           = require('fs');
 const EventEmitter = require('events');
 
+const CHUNK_DURATION_MS = 10 * 60 * 1000;
+
 // ── macOS bridge (Swift binary via stdin/stdout JSON protocol) ────────────────
 
 class MacBridge extends EventEmitter {
   constructor() {
     super();
-    this._proc = null;
-    this._rl   = null;
+    this._proc        = null;
+    this._rl          = null;
+    this._chunkDir    = null;
+    this._chunkIndex  = 0;
+    this._chunkTimer  = null;
+    this._activeRoll  = null; // Promise<void> while a roll is in progress
   }
 
   _binaryPath() {
     const { app } = require('electron');
     if (app.isPackaged) return path.join(process.resourcesPath, 'audio-recorder');
     return path.join(__dirname, 'resources', 'audio-recorder');
+  }
+
+  _chunkPath(n) {
+    return path.join(this._chunkDir, `chunk-${n}.wav`);
   }
 
   _ensureProcess() {
@@ -72,16 +83,16 @@ class MacBridge extends EventEmitter {
     });
   }
 
-  async startRecording(outputPath) {
-    this._ensureProcess();
-    const pending = this._nextMessage();
-    this._proc.stdin.write(JSON.stringify({ cmd: 'start', output: outputPath }) + '\n');
+  // Send the start command for the current chunk index.
+  async _startChunk() {
+    const pending = this._nextMessage(30_000);
+    this._proc.stdin.write(JSON.stringify({ cmd: 'start', output: this._chunkPath(this._chunkIndex) }) + '\n');
     const msg = await pending;
     if (msg.status === 'error') throw new Error(msg.message);
   }
 
-  async stopRecording() {
-    if (!this._proc) throw new Error('No active recording process');
+  // Stop the current chunk, return its finalized path.
+  async _stopCurrentChunk() {
     const pending = this._nextMessage(60_000);
     this._proc.stdin.write(JSON.stringify({ cmd: 'stop' }) + '\n');
     const msg = await pending;
@@ -89,7 +100,63 @@ class MacBridge extends EventEmitter {
     return msg.path;
   }
 
+  // Called by the 10-minute timer. Finalizes the current chunk, starts the next one.
+  _rollChunk() {
+    if (this._activeRoll) return; // re-entry guard
+    this._activeRoll = this._doRoll().finally(() => { this._activeRoll = null; });
+  }
+
+  async _doRoll() {
+    const finishedIndex = this._chunkIndex;
+    let   finishedPath;
+    try {
+      finishedPath = await this._stopCurrentChunk();
+    } catch (err) {
+      console.error('[mac-bridge] error stopping chunk for roll:', err.message);
+      return;
+    }
+
+    this._chunkIndex++;
+
+    // Emit before starting next chunk so the upload can proceed in parallel.
+    this.emit('chunk-ready', { path: finishedPath, index: finishedIndex });
+
+    try {
+      await this._startChunk();
+    } catch (err) {
+      console.error('[mac-bridge] error starting next chunk:', err.message);
+      return;
+    }
+
+    this._chunkTimer = setTimeout(() => this._rollChunk(), CHUNK_DURATION_MS);
+  }
+
+  async startRecording(chunkDir) {
+    this._chunkDir   = chunkDir;
+    this._chunkIndex = 1;
+    this._ensureProcess();
+    await this._startChunk();
+    this._chunkTimer = setTimeout(() => this._rollChunk(), CHUNK_DURATION_MS);
+  }
+
+  async stopRecording() {
+    clearTimeout(this._chunkTimer);
+    this._chunkTimer = null;
+    if (this._activeRoll) await this._activeRoll;
+
+    if (!this._proc) throw new Error('No active recording process');
+
+    const finalIndex = this._chunkIndex;
+    const finalPath  = await this._stopCurrentChunk();
+
+    this._chunkDir   = null;
+    this._chunkIndex = 0;
+
+    return { path: finalPath, index: finalIndex };
+  }
+
   shutdown() {
+    clearTimeout(this._chunkTimer);
     if (this._proc) {
       try { this._proc.stdin.write(JSON.stringify({ cmd: 'quit' }) + '\n'); } catch {}
       this._proc = null;
@@ -102,16 +169,24 @@ class MacBridge extends EventEmitter {
 // audio_capture.exe (WASAPI loopback) → raw PCM stdout
 //   → piped into ffmpeg stdin as s16le 44100 2ch (system audio)
 //   + ffmpeg DirectShow mic input (best-effort; omitted if no mic found)
-//   → WAV file on disk
+//   → WAV chunk file on disk
 //
-// Stopping: kill audio_capture → its stdout EOF propagates to ffmpeg stdin →
-// ffmpeg finalises the WAV header and exits cleanly.
+// Rolling: kill audio_capture → its stdout EOF propagates to ffmpeg stdin →
+// ffmpeg finalises the WAV header and exits cleanly. Then spawn fresh pair.
 
-class WinBridge {
+class WinBridge extends EventEmitter {
   constructor() {
-    this._captureProc = null;   // audio_capture.exe
-    this._ffmpegProc  = null;   // ffmpeg
-    this._outputPath  = null;
+    super();
+    this._captureProc    = null;
+    this._ffmpegProc     = null;
+    this._chunkDir       = null;
+    this._chunkIndex     = 0;
+    this._chunkTimer     = null;
+    this._activeRoll     = null;
+    // Cached on first startRecording so rolls don't re-enumerate.
+    this._captureBinPath = null;
+    this._ffmpegBinPath  = null;
+    this._micDevice      = null;
   }
 
   // Locate audio_capture.exe: resources folder (packaged) or native/ subdir (dev).
@@ -162,7 +237,105 @@ class WinBridge {
     });
   }
 
-  async startRecording(outputPath) {
+  _chunkPath(n) {
+    return path.join(this._chunkDir, `chunk-${n}.wav`);
+  }
+
+  // Spawn audio_capture.exe + ffmpeg for a single chunk output file.
+  // Resolves when ffmpeg signals it is actively recording.
+  _spawnChunk(outputPath) {
+    const captureBin = this._captureBinPath;
+    const ffmpegBin  = this._ffmpegBinPath;
+    const mic        = this._micDevice;
+
+    this._captureProc = spawn(captureBin, [
+      '--sample-rate', '44100', '--channels', '2', '--bit-depth', '16',
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    this._captureProc.stderr.on('data', d => process.stderr.write('[audio_capture] ' + d));
+
+    const ffmpegArgs = mic ? [
+      '-f', 's16le', '-ar', '44100', '-ac', '2', '-i', 'pipe:0',
+      '-f', 'dshow', '-i', `audio=${mic}`,
+      '-filter_complex', 'amix=inputs=2:duration=first',
+      '-acodec', 'pcm_s16le', '-ar', '44100', '-ac', '2',
+      '-y', outputPath,
+    ] : [
+      '-f', 's16le', '-ar', '44100', '-ac', '2', '-i', 'pipe:0',
+      '-acodec', 'pcm_s16le', '-ar', '44100', '-ac', '2',
+      '-y', outputPath,
+    ];
+
+    console.log(`[win-bridge] spawning chunk → ${outputPath}${mic ? ' (+ mic)' : ''}`);
+    this._ffmpegProc = spawn(ffmpegBin, ffmpegArgs, { stdio: ['pipe', 'ignore', 'pipe'] });
+    this._captureProc.stdout.pipe(this._ffmpegProc.stdin);
+
+    return new Promise((resolve, reject) => {
+      let resolved = false;
+      const done = (err) => { if (!resolved) { resolved = true; err ? reject(err) : resolve(); } };
+
+      this._ffmpegProc.stderr.on('data', d => {
+        const text = d.toString();
+        process.stderr.write('[ffmpeg] ' + text);
+        if (/Press \[q\]|size=\s*\d+kB/i.test(text)) done();
+      });
+      this._captureProc.on('error', done);
+      this._ffmpegProc.on('error', done);
+      this._ffmpegProc.on('exit', (code, sig) => {
+        this._ffmpegProc = null;
+        done(new Error(`ffmpeg exited before recording started (code=${code}, signal=${sig})`));
+      });
+      // Resolve after 8 s regardless — some builds don't print the ready line.
+      setTimeout(() => done(), 8_000);
+    });
+  }
+
+  // Gracefully stop the current chunk: kill audio_capture → EOF → ffmpeg writes WAV trailer.
+  _stopCurrentChunk() {
+    return new Promise(resolve => {
+      if (this._ffmpegProc) {
+        this._ffmpegProc.once('exit', () => { this._ffmpegProc = null; resolve(); });
+      } else {
+        resolve();
+      }
+      try { this._captureProc?.kill(); } catch {}
+      this._captureProc = null;
+      try { this._ffmpegProc?.stdin?.end(); } catch {}
+      // Hard-kill fallback after 10 s.
+      setTimeout(() => { try { this._ffmpegProc?.kill(); } catch {} resolve(); }, 10_000);
+    });
+  }
+
+  _rollChunk() {
+    if (this._activeRoll) return; // re-entry guard
+    this._activeRoll = this._doRoll().finally(() => { this._activeRoll = null; });
+  }
+
+  async _doRoll() {
+    const finishedPath  = this._chunkPath(this._chunkIndex);
+    const finishedIndex = this._chunkIndex;
+
+    await this._stopCurrentChunk();
+
+    let fileSize = 0;
+    try { fileSize = fs.statSync(finishedPath).size; } catch {}
+    console.log(`[win-bridge] chunk ${finishedIndex} finalized — ${fileSize} bytes`);
+
+    this._chunkIndex++;
+
+    // Emit before spawning next chunk so upload starts in parallel with next chunk startup.
+    this.emit('chunk-ready', { path: finishedPath, index: finishedIndex });
+
+    try {
+      await this._spawnChunk(this._chunkPath(this._chunkIndex));
+    } catch (err) {
+      console.error('[win-bridge] error starting next chunk:', err.message);
+      return;
+    }
+
+    this._chunkTimer = setTimeout(() => this._rollChunk(), CHUNK_DURATION_MS);
+  }
+
+  async startRecording(chunkDir) {
     const captureBin = this._captureBin();
     if (!fs.existsSync(captureBin)) {
       const e = new Error(`audio_capture.exe not found at ${captureBin}`);
@@ -177,104 +350,43 @@ class WinBridge {
       throw e;
     }
 
-    this._outputPath = outputPath;
+    this._chunkDir       = chunkDir;
+    this._chunkIndex     = 1;
+    this._captureBinPath = captureBin;
+    this._ffmpegBinPath  = ffmpegBin;
+    this._micDevice      = await this._findDefaultMic(ffmpegBin);
 
-    // Enumerate mic devices (best-effort; null → system audio only).
-    const mic = await this._findDefaultMic(ffmpegBin);
-
-    // Spawn audio_capture.exe — its stdout is raw PCM s16le 44100 2ch.
-    this._captureProc = spawn(captureBin, [
-      '--sample-rate', '44100', '--channels', '2', '--bit-depth', '16',
-    ], { stdio: ['ignore', 'pipe', 'pipe'] });
-    this._captureProc.stderr.on('data', d => process.stderr.write('[audio_capture] ' + d));
-
-    // Build ffmpeg input args: pipe:0 = system audio (WASAPI loopback via stdin).
-    let ffmpegArgs;
-    if (mic) {
-      console.log(`[win-bridge] WASAPI loopback + mic (${mic})`);
-      ffmpegArgs = [
-        '-f', 's16le', '-ar', '44100', '-ac', '2', '-i', 'pipe:0',
-        '-f', 'dshow', '-i', `audio=${mic}`,
-        '-filter_complex', 'amix=inputs=2:duration=first',
-        '-acodec', 'pcm_s16le', '-ar', '44100', '-ac', '2',
-        '-y', outputPath,
-      ];
-    } else {
-      console.log('[win-bridge] WASAPI loopback only (no mic found)');
-      ffmpegArgs = [
-        '-f', 's16le', '-ar', '44100', '-ac', '2', '-i', 'pipe:0',
-        '-acodec', 'pcm_s16le', '-ar', '44100', '-ac', '2',
-        '-y', outputPath,
-      ];
-    }
-
-    console.log(`[win-bridge] ffmpeg args: ${ffmpegArgs.join(' ')}`);
-    this._ffmpegProc = spawn(ffmpegBin, ffmpegArgs, { stdio: ['pipe', 'ignore', 'pipe'] });
-
-    // Wire WASAPI PCM → ffmpeg stdin.
-    this._captureProc.stdout.pipe(this._ffmpegProc.stdin);
-
-    return new Promise((resolve, reject) => {
-      let resolved = false;
-
-      this._ffmpegProc.stderr.on('data', d => {
-        const text = d.toString();
-        process.stderr.write('[ffmpeg] ' + text);
-        if (!resolved && /Press \[q\]|size=\s*\d+kB/i.test(text)) {
-          resolved = true; resolve();
-        }
-      });
-
-      this._captureProc.on('error', err => {
-        if (!resolved) { resolved = true; reject(err); }
-      });
-      this._ffmpegProc.on('error', err => {
-        if (!resolved) { resolved = true; reject(err); }
-      });
-      this._ffmpegProc.on('exit', (code, sig) => {
-        this._ffmpegProc = null;
-        if (!resolved) {
-          resolved = true;
-          reject(new Error(`ffmpeg exited before recording started (code=${code}, signal=${sig})`));
-        }
-      });
-
-      // Resolve after 8 s regardless — some builds don't print the ready line.
-      setTimeout(() => { if (!resolved) { resolved = true; resolve(); } }, 8_000);
-    });
+    await this._spawnChunk(this._chunkPath(1));
+    this._chunkTimer = setTimeout(() => this._rollChunk(), CHUNK_DURATION_MS);
   }
 
   async stopRecording() {
     if (!this._captureProc && !this._ffmpegProc) throw new Error('No active recording');
-    const outputPath = this._outputPath;
 
-    await new Promise(resolve => {
-      if (this._ffmpegProc) {
-        this._ffmpegProc.once('exit', () => { this._ffmpegProc = null; resolve(); });
-      } else {
-        resolve();
-      }
+    clearTimeout(this._chunkTimer);
+    this._chunkTimer = null;
+    if (this._activeRoll) await this._activeRoll;
 
-      // Killing audio_capture closes its stdout; propagate EOF to ffmpeg stdin so
-      // ffmpeg writes the WAV trailer and exits cleanly.
-      try { this._captureProc?.kill(); } catch {}
-      this._captureProc = null;
-      try { this._ffmpegProc?.stdin?.end(); } catch {}
+    const finalPath  = this._chunkPath(this._chunkIndex);
+    const finalIndex = this._chunkIndex;
 
-      // Hard-kill fallback after 10 s.
-      setTimeout(() => { try { this._ffmpegProc?.kill(); } catch {} resolve(); }, 10_000);
-    });
+    await this._stopCurrentChunk();
 
     let fileSize = 0;
-    try { fileSize = fs.statSync(outputPath).size; } catch {}
-    console.log(`[win-bridge] recording stopped — output: ${outputPath} (${fileSize} bytes)`);
+    try { fileSize = fs.statSync(finalPath).size; } catch {}
+    console.log(`[win-bridge] final chunk ${finalIndex} — ${finalPath} (${fileSize} bytes)`);
     if (fileSize === 0) {
-      throw new Error(`Recording produced an empty file at ${outputPath}. Check stderr above for details.`);
+      throw new Error(`Recording chunk ${finalIndex} is empty at ${finalPath}. Check stderr above.`);
     }
-    return outputPath;
+
+    this._chunkDir   = null;
+    this._chunkIndex = 0;
+
+    return { path: finalPath, index: finalIndex };
   }
 
   shutdown() {
+    clearTimeout(this._chunkTimer);
     try { this._captureProc?.kill(); } catch {}
     try { this._ffmpegProc?.kill(); } catch {}
     this._captureProc = null;
