@@ -13,8 +13,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   pickAndUploadFile: () => ipcRenderer.invoke('pick-and-upload-file'),
 
-  uploadFileBuffer: (buffer, filename, mimeType, userId) =>
-    ipcRenderer.invoke('upload-file-buffer', { buffer, filename, mimeType, userId }),
+  uploadFileBuffer: (buffer, filename, mimeType, userId, meetingId) =>
+    ipcRenderer.invoke('upload-file-buffer', { buffer, filename, mimeType, userId, meetingId }),
 
   // Permission helpers — called by the frontend's onboarding modal
   requestMicPermission: () => ipcRenderer.invoke('request-mic-permission'),

@@ -313,10 +313,11 @@ ipcMain.handle('read-file-buffer', async (_event, filePath) => {
 // ── IPC: upload a file buffer sent from the renderer directly to backend ─────
 // Lets the Vercel frontend bypass its own upload limit by handing the raw bytes
 // to the main process, which posts them straight to Railway.
-ipcMain.handle('upload-file-buffer', async (_event, { buffer, filename, mimeType, userId }) => {
+ipcMain.handle('upload-file-buffer', async (_event, { buffer, filename, mimeType, userId, meetingId }) => {
   const formData = new FormData();
   formData.append('file', new Blob([buffer], { type: mimeType }), filename);
   if (userId) formData.append('user_id', userId);
+  if (meetingId) formData.append('meeting_id', meetingId);
   const res = await fetch(BACKEND_URL, { method: 'POST', body: formData });
   if (!res.ok) throw new Error(`Backend returned ${res.status}`);
   return await res.json();
