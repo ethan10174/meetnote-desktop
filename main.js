@@ -253,7 +253,7 @@ let currentRecordingDir = null;
 let currentMeetingId    = null;
 
 ipcMain.handle('start-recording', async (_event) => {
-  console.log('[main] start-recording received');
+  console.log('[main] start-recording received', new Date().toISOString());
   try {
     currentMeetingId    = `meeting-${Date.now()}`;
     currentRecordingDir = path.join(os.tmpdir(), currentMeetingId);
@@ -278,6 +278,7 @@ ipcMain.handle('start-recording', async (_event) => {
 
 // ── IPC: stop recording — finalize last chunk and upload as final ─────────────
 ipcMain.handle('stop-recording', async (_event, { userId } = {}) => {
+  console.log('[main] stop-recording received', new Date().toISOString());
   const recordingDir = currentRecordingDir;
   const meetingId    = currentMeetingId;
   currentRecordingDir = null;
