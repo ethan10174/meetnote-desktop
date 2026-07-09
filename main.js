@@ -36,7 +36,7 @@ async function uploadChunk(filePath, chunkIndex, meetingId, isFinal, userId) {
   if (userId) formData.append('user_id', userId);
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 120_000);
+  const timeout = setTimeout(() => controller.abort(), 300_000);
   let res;
   try {
     res = await fetch(url.toString(), { method: 'POST', body: formData, signal: controller.signal });
@@ -270,7 +270,7 @@ let currentRecordingDir = null;
 let currentMeetingId    = null;
 
 ipcMain.handle('start-recording', async (_event) => {
-  console.log('[main] start-recording received', new Date().toISOString());
+  console.log('[main] start-recording received at', Date.now());
   try {
     currentMeetingId    = `meeting-${Date.now()}`;
     currentRecordingDir = path.join(os.tmpdir(), currentMeetingId);
@@ -295,7 +295,7 @@ ipcMain.handle('start-recording', async (_event) => {
 
 // ── IPC: stop recording — finalize last chunk and upload as final ─────────────
 ipcMain.handle('stop-recording', async (_event, { userId } = {}) => {
-  console.log('[main] stop-recording received', new Date().toISOString());
+  console.log('[main] stop-recording received at', Date.now());
   const recordingDir = currentRecordingDir;
   const meetingId    = currentMeetingId;
   currentRecordingDir = null;
