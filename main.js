@@ -29,12 +29,29 @@ async function uploadChunk(filePath, chunkIndex, meetingId, isFinal, userId) {
   if (isFinal) url.searchParams.set('final', 'true');
 
   const fileBuffer = fs.readFileSync(filePath);
-  const formData   = new FormData();
+  console.log(`[uploadChunk] starting upload — meeting_id=${meetingId} chunk=${chunkIndex} isFinal=${isFinal} size=${fileBuffer.byteLength} bytes`);
+
+  const formData = new FormData();
   formData.append('file', new Blob([fileBuffer], { type: 'audio/wav' }), `chunk-${chunkIndex}.wav`);
   if (userId) formData.append('user_id', userId);
 
-  const res = await fetch(url.toString(), { method: 'POST', body: formData });
-  if (!res.ok) throw new Error(`Backend returned ${res.status}`);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 120_000);
+  let res;
+  try {
+    res = await fetch(url.toString(), { method: 'POST', body: formData, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  if (!res.ok) {
+    let body = '';
+    try { body = await res.text(); } catch (_) {}
+    console.error(`[uploadChunk] upload failed — status=${res.status} meeting_id=${meetingId} chunk=${chunkIndex}`);
+    console.error(`[uploadChunk] response body:`, body);
+    throw new Error(`Backend returned ${res.status}: ${body}`);
+  }
+
   const result = await res.json();
   fs.unlink(filePath, () => {});
   return result;
