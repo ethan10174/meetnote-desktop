@@ -269,10 +269,10 @@ ipcMain.handle('get-screen-recording-status', () => {
 let currentRecordingDir = null;
 let currentMeetingId    = null;
 
-ipcMain.handle('start-recording', async (_event) => {
+ipcMain.handle('start-recording', async (_event, { meetingId } = {}) => {
   console.log('[main] start-recording received at', Date.now());
   try {
-    currentMeetingId    = `meeting-${Date.now()}`;
+    currentMeetingId    = meetingId || `meeting-${Date.now()}`;
     currentRecordingDir = path.join(os.tmpdir(), currentMeetingId);
     fs.mkdirSync(currentRecordingDir, { recursive: true });
     await nativeBridge.startRecording(currentRecordingDir);

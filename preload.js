@@ -7,7 +7,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('electronAPI', {
   isElectron: true,
 
-  startRecording: () => ipcRenderer.invoke('start-recording'),
+  startRecording: (meetingId) => ipcRenderer.invoke('start-recording', { meetingId }),
 
   stopRecording: (userId) => ipcRenderer.invoke('stop-recording', { userId }),
 
