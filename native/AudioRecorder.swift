@@ -48,6 +48,15 @@ final class Recorder: NSObject {
     private let sysLock = NSLock()
     private let micLock = NSLock()
 
+    private let sysTargetFmt: AVAudioFormat = AVAudioFormat(
+        commonFormat: .pcmFormatFloat32,
+        sampleRate: SAMPLE_RATE,
+        channels: AVAudioChannelCount(CHANNELS),
+        interleaved: false
+    )!
+    private var sysConverter: AVAudioConverter?
+    private var sysFirstFrame = true
+
     private var sysPath = ""
     private var micPath = ""
     private var outputPath = ""
@@ -229,9 +238,37 @@ final class Recorder: NSObject {
     }
 
     private func writeSysBuffer(_ buf: AVAudioPCMBuffer, format: AVAudioFormat) {
-        guard let ch = buf.floatChannelData else { return }
-        let frames = Int(buf.frameLength)
-        let nch = min(Int(format.channelCount), CHANNELS)
+        if sysFirstFrame {
+            sysFirstFrame = false
+            log("[recorder] SCStream native format: \(format.sampleRate) Hz, \(format.channelCount) ch, interleaved=\(format.isInterleaved)")
+            let needsConversion = format.sampleRate != SAMPLE_RATE
+                || format.channelCount != AVAudioChannelCount(CHANNELS)
+                || format.isInterleaved
+            if needsConversion {
+                sysConverter = AVAudioConverter(from: format, to: sysTargetFmt)
+            }
+        }
+
+        let outBuf: AVAudioPCMBuffer
+        if let conv = sysConverter {
+            let ratio = SAMPLE_RATE / format.sampleRate
+            let cap = AVAudioFrameCount(Double(buf.frameLength) * ratio + 1)
+            guard let dest = AVAudioPCMBuffer(pcmFormat: sysTargetFmt, frameCapacity: cap) else { return }
+            var convError: NSError?
+            var inputConsumed = false
+            conv.convert(to: dest, error: &convError) { _, outStatus in
+                if inputConsumed { outStatus.pointee = .noDataNow; return nil }
+                inputConsumed = true; outStatus.pointee = .haveData; return buf
+            }
+            guard convError == nil else { return }
+            outBuf = dest
+        } else {
+            outBuf = buf
+        }
+
+        guard let ch = outBuf.floatChannelData else { return }
+        let frames = Int(outBuf.frameLength)
+        let nch = min(Int(outBuf.format.channelCount), CHANNELS)
         var interleaved = [Float](repeating: 0, count: frames * CHANNELS)
         for f in 0..<frames {
             for c in 0..<CHANNELS {
