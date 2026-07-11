@@ -267,6 +267,9 @@ class WinBridge extends EventEmitter {
 
     console.log(`[win-bridge] spawning chunk → ${outputPath}${mic ? ' (+ mic)' : ''}`);
     this._ffmpegProc = spawn(ffmpegBin, ffmpegArgs, { stdio: ['pipe', 'ignore', 'pipe'] });
+    this._ffmpegProc.stdin.on('error', (err) => {
+      console.error('[win-bridge] ffmpeg stdin error (EPIPE suppressed):', err.message);
+    });
     this._captureProc.stdout.pipe(this._ffmpegProc.stdin);
 
     return new Promise((resolve, reject) => {
@@ -356,7 +359,14 @@ class WinBridge extends EventEmitter {
     this._ffmpegBinPath  = ffmpegBin;
     this._micDevice      = await this._findDefaultMic(ffmpegBin);
 
-    await this._spawnChunk(this._chunkPath(1));
+    try {
+      await this._spawnChunk(this._chunkPath(1));
+    } catch (err) {
+      console.error('[win-bridge] startRecording failed:', err.message);
+      const e = new Error(err.message);
+      e.code = 'FFMPEG_UNAVAILABLE';
+      throw e;
+    }
     this._chunkTimer = setTimeout(() => this._rollChunk(), CHUNK_DURATION_MS);
   }
 

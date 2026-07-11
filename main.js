@@ -285,7 +285,7 @@ ipcMain.handle('start-recording', async (_event, { meetingId } = {}) => {
     }
     currentRecordingDir = null;
     currentMeetingId    = null;
-    if (err.code === 'FFMPEG_UNAVAILABLE') {
+    if (err.code === 'FFMPEG_UNAVAILABLE' || err.code === 'EPIPE') {
       console.log('[main] start-recording complete — fallbackToBrowser');
       return { fallbackToBrowser: true };
     }
