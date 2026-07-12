@@ -146,6 +146,7 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       allowRunningInsecureContent: false,
+      partition: 'persist:meetnote',
     },
   });
 
