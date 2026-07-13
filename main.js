@@ -17,6 +17,24 @@ const NEXT_URL    = 'https://meeting-frontend-ashy.vercel.app';
 const BACKEND_URL = 'https://meeting-backend-production-ca80.up.railway.app/upload';
 
 let oauthServer = null; // loopback HTTP server used during OAuth
+let store       = null; // electron-store instance (ESM; initialized in app.whenReady)
+
+// ── Supabase session persistence (electron-store) ─────────────────────────────
+
+ipcMain.on('get-session-sync', (event) => {
+  event.returnValue = store ? (store.get('supabase-session') ?? null) : null;
+});
+
+ipcMain.handle('save-session', (_event, session) => {
+  if (!store) return;
+  if (session) {
+    store.set('supabase-session', session);
+    console.log('[main] Supabase session saved');
+  } else {
+    store.delete('supabase-session');
+    console.log('[main] Supabase session cleared');
+  }
+});
 
 // ── Chunk upload helper ───────────────────────────────────────────────────────
 // Posts a single WAV chunk to the backend with chunk metadata as query params.
@@ -179,6 +197,34 @@ function createWindow() {
 
   wc.once('did-finish-load', () => {
     wc.executeJavaScript('Notification.requestPermission()').catch(() => {});
+
+    // Intercept localStorage writes for the Supabase auth key so every
+    // token change (login, refresh, sign-out) is persisted to electron-store.
+    wc.executeJavaScript(`
+      (() => {
+        const KEY = 'sb-dpikisphgxwcysvvvltf-auth-token';
+        // Save whatever is already in localStorage (covers page-load restore).
+        const cur = localStorage.getItem(KEY);
+        if (cur) { try { window.electronAPI.saveSession(JSON.parse(cur)); } catch {} }
+        // Intercept future writes.
+        const _set = Storage.prototype.setItem;
+        Storage.prototype.setItem = function(k, v) {
+          _set.call(this, k, v);
+          if (k === KEY) { try { window.electronAPI.saveSession(JSON.parse(v)); } catch {} }
+        };
+        // Intercept sign-out / session removal.
+        const _remove = Storage.prototype.removeItem;
+        Storage.prototype.removeItem = function(k) {
+          _remove.call(this, k);
+          if (k === KEY) window.electronAPI.saveSession(null);
+        };
+        const _clear = Storage.prototype.clear;
+        Storage.prototype.clear = function() {
+          _clear.call(this);
+          window.electronAPI.saveSession(null);
+        };
+      })();
+    `).catch(() => {});
   });
 
   wc.setWindowOpenHandler(({ url }) => {
@@ -452,6 +498,9 @@ app.whenReady().then(async () => {
   if (process.platform === 'darwin') {
     await systemPreferences.askForMediaAccess('microphone');
   }
+
+  const { default: Store } = await import('electron-store');
+  store = new Store();
 
   createWindow();
 
