@@ -147,6 +147,34 @@ fetch('/done', {
 
 function createWindow() {
   const isWin = process.platform === 'win32';
+
+  // Use the named persistent partition for this window so cookies, localStorage,
+  // and Supabase auth tokens survive across app restarts.
+  const ses = session.fromPartition('persist:meetnote');
+
+  ses.setPermissionRequestHandler((_webContents, permission, callback) => {
+    const allowed = ['media', 'microphone', 'audioCapture', 'desktopCapture', 'autoplay', 'screen'];
+    callback(allowed.includes(permission));
+  });
+
+  // Inject Supabase into connect-src so the renderer can reach it without CSP errors.
+  ses.webRequest.onHeadersReceived((details, callback) => {
+    const headers = { ...details.responseHeaders };
+    const cspKey = Object.keys(headers).find(k => k.toLowerCase() === 'content-security-policy');
+    if (cspKey) {
+      let csp = headers[cspKey][0];
+      if (!csp.includes('dpikisphgxwcysvvvltf.supabase.co')) {
+        if (/connect-src/i.test(csp)) {
+          csp = csp.replace(/connect-src\s/i, 'connect-src https://dpikisphgxwcysvvvltf.supabase.co ');
+        } else {
+          csp += '; connect-src https://dpikisphgxwcysvvvltf.supabase.co';
+        }
+        headers[cspKey] = [csp];
+      }
+    }
+    callback({ responseHeaders: headers });
+  });
+
   const win = new BrowserWindow({
     width: 1200,
     height: 800,
@@ -164,31 +192,8 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       allowRunningInsecureContent: false,
-      partition: 'persist:meetnote',
+      session: ses,
     },
-  });
-
-  session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
-    const allowed = ['media', 'microphone', 'audioCapture', 'desktopCapture', 'autoplay', 'screen'];
-    callback(allowed.includes(permission));
-  });
-
-  // Inject Supabase into connect-src so the renderer can reach it without CSP errors.
-  session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
-    const headers = { ...details.responseHeaders };
-    const cspKey = Object.keys(headers).find(k => k.toLowerCase() === 'content-security-policy');
-    if (cspKey) {
-      let csp = headers[cspKey][0];
-      if (!csp.includes('dpikisphgxwcysvvvltf.supabase.co')) {
-        if (/connect-src/i.test(csp)) {
-          csp = csp.replace(/connect-src\s/i, 'connect-src https://dpikisphgxwcysvvvltf.supabase.co ');
-        } else {
-          csp += '; connect-src https://dpikisphgxwcysvvvltf.supabase.co';
-        }
-        headers[cspKey] = [csp];
-      }
-    }
-    callback({ responseHeaders: headers });
   });
 
   win.loadURL(NEXT_URL);
