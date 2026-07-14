@@ -245,26 +245,28 @@ function createWindow() {
       console.log('[main] did-finish-load: no stored session to refresh');
     }
 
-    const storedJson = JSON.stringify(sessionToInject);
+    const accessToken  = sessionToInject?.access_token  ?? null;
+    const refreshToken = sessionToInject?.refresh_token ?? null;
     console.log('[main] injecting session:', sessionToInject ? ('user=' + (sessionToInject.user && sessionToInject.user.email)) : 'null');
 
-    // Inject into localStorage now that React + Supabase listeners are ready,
-    // then fire meetnote:session-restored so the renderer can call getSession().
     wc.executeJavaScript(`
       (() => {
-        const KEY = 'sb-dpikisphgxwcysvvvltf-auth-token';
-        const stored = ${storedJson};
-        if (stored) {
-          try {
-            localStorage.setItem(KEY, JSON.stringify(stored));
-            console.log('[renderer] session injected, dispatching meetnote:session-restored');
-            window.dispatchEvent(new Event('meetnote:session-restored'));
-          } catch (e) {
-            console.error('[renderer] session inject failed:', e.message);
+        const KEY          = 'sb-dpikisphgxwcysvvvltf-auth-token';
+        const accessToken  = ${JSON.stringify(accessToken)};
+        const refreshToken = ${JSON.stringify(refreshToken)};
+
+        if (accessToken && refreshToken) {
+          if (window.__supabase) {
+            window.__supabase.auth.setSession({ access_token: accessToken, refresh_token: refreshToken })
+              .then(() => console.log('[renderer] supabase.auth.setSession succeeded'))
+              .catch(e  => console.error('[renderer] supabase.auth.setSession failed:', e.message));
+          } else {
+            console.warn('[renderer] window.__supabase not available');
           }
         } else {
           console.log('[renderer] no session to inject — user will see login screen');
         }
+
         // Save whatever is in localStorage now (covers sessions the page set itself).
         const cur = localStorage.getItem(KEY);
         if (cur) { try { window.electronAPI.saveSession(JSON.parse(cur)); } catch {} }
