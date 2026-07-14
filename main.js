@@ -250,16 +250,21 @@ function createWindow() {
     console.log('[main] injecting session:', sessionToInject ? ('user=' + (sessionToInject.user && sessionToInject.user.email)) : 'null');
 
     wc.executeJavaScript(`
-      (() => {
+      (async () => {
         const KEY          = 'sb-dpikisphgxwcysvvvltf-auth-token';
         const accessToken  = ${JSON.stringify(accessToken)};
         const refreshToken = ${JSON.stringify(refreshToken)};
 
-        if (refreshToken) {
-          console.log('[renderer] dispatching meetnote:session-restored with refresh_token');
-          window.dispatchEvent(new CustomEvent('meetnote:session-restored', {
-            detail: { refresh_token: refreshToken },
-          }));
+        if (accessToken && refreshToken) {
+          if (window.__meetnoteSupabase) {
+            const { error } = await window.__meetnoteSupabase.auth.setSession({
+              access_token:  accessToken,
+              refresh_token: refreshToken,
+            });
+            console.log('[renderer] setSession result:', error ? error.message : 'success');
+          } else {
+            console.log('[renderer] __meetnoteSupabase not found on window');
+          }
         } else {
           console.log('[renderer] no session to inject — user will see login screen');
         }
