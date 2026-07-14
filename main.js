@@ -13,8 +13,10 @@ const http           = require('http');
 
 app.setName('MeetNote');
 
-const NEXT_URL    = 'https://meeting-frontend-ashy.vercel.app';
-const BACKEND_URL = 'https://meeting-backend-production-ca80.up.railway.app/upload';
+const NEXT_URL          = 'https://meeting-frontend-ashy.vercel.app';
+const BACKEND_URL       = 'https://meeting-backend-production-ca80.up.railway.app/upload';
+const SUPABASE_URL      = 'https://dpikisphgxwcysvvvltf.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRwaWtpc3BoZ3h3Y3lzdnZ2bHRmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc0Mjk4NjAsImV4cCI6MjA5MzAwNTg2MH0.doJpmszT7iR96HdmXjfiDLTbPJeBm7NZvJP1YenF_6g';
 
 let oauthServer = null; // loopback HTTP server used during OAuth
 let store       = null; // electron-store instance (ESM; initialized in app.whenReady)
@@ -145,6 +147,26 @@ fetch('/done', {
   });
 }
 
+// ── Supabase token refresh ─────────────────────────────────────────────────────
+// Called from did-finish-load to exchange a stored refresh_token for a fresh
+// access_token before injecting into the renderer.  Throws on network error or
+// a non-2xx response (e.g. 400 "Invalid Refresh Token" when revoked).
+async function refreshSupabaseSession(refreshToken) {
+  const res = await fetch(
+    SUPABASE_URL + '/auth/v1/token?grant_type=refresh_token',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', apikey: SUPABASE_ANON_KEY },
+      body: JSON.stringify({ refresh_token: refreshToken }),
+    }
+  );
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error('Supabase refresh ' + res.status + ': ' + body);
+  }
+  return res.json();
+}
+
 function createWindow() {
   const isWin = process.platform === 'win32';
 
@@ -200,16 +222,34 @@ function createWindow() {
 
   const wc = win.webContents;
 
-  wc.once('did-finish-load', () => {
+  wc.once('did-finish-load', async () => {
     wc.executeJavaScript('Notification.requestPermission()').catch(() => {});
 
-    // Inject the persisted Supabase session from electron-store into localStorage
-    // now that all React components and Supabase listeners are initialized, then
-    // fire meetnote:session-restored so the renderer can call getSession() again.
-    const storedSession = store ? (store.get('supabase-session') ?? null) : null;
-    const storedJson = JSON.stringify(storedSession); // "null" or the session object
-    console.log('[main] did-finish-load session to inject:', storedSession ? ('user=' + (storedSession.user && storedSession.user.email)) : 'null');
+    // Resolve the session to inject: attempt a token refresh first so the
+    // renderer always gets a valid (non-expired) access token.
+    let sessionToInject = store ? (store.get('supabase-session') ?? null) : null;
 
+    if (sessionToInject && sessionToInject.refresh_token) {
+      console.log('[main] refreshing stored Supabase token for user:', sessionToInject.user && sessionToInject.user.email);
+      try {
+        const refreshed = await refreshSupabaseSession(sessionToInject.refresh_token);
+        store.set('supabase-session', refreshed);
+        sessionToInject = refreshed;
+        console.log('[main] token refreshed — new expiry:', refreshed.expires_at);
+      } catch (err) {
+        console.warn('[main] token refresh failed:', err.message, '— clearing stored session');
+        store.delete('supabase-session');
+        sessionToInject = null;
+      }
+    } else {
+      console.log('[main] did-finish-load: no stored session to refresh');
+    }
+
+    const storedJson = JSON.stringify(sessionToInject);
+    console.log('[main] injecting session:', sessionToInject ? ('user=' + (sessionToInject.user && sessionToInject.user.email)) : 'null');
+
+    // Inject into localStorage now that React + Supabase listeners are ready,
+    // then fire meetnote:session-restored so the renderer can call getSession().
     wc.executeJavaScript(`
       (() => {
         const KEY = 'sb-dpikisphgxwcysvvvltf-auth-token';
@@ -217,15 +257,15 @@ function createWindow() {
         if (stored) {
           try {
             localStorage.setItem(KEY, JSON.stringify(stored));
-            console.log('[renderer] session injected into localStorage, dispatching meetnote:session-restored');
+            console.log('[renderer] session injected, dispatching meetnote:session-restored');
             window.dispatchEvent(new Event('meetnote:session-restored'));
           } catch (e) {
             console.error('[renderer] session inject failed:', e.message);
           }
         } else {
-          console.log('[renderer] no stored session to inject');
+          console.log('[renderer] no session to inject — user will see login screen');
         }
-        // Save whatever is in localStorage now (covers sessions already present).
+        // Save whatever is in localStorage now (covers sessions the page set itself).
         const cur = localStorage.getItem(KEY);
         if (cur) { try { window.electronAPI.saveSession(JSON.parse(cur)); } catch {} }
         // Intercept future writes so every auth state change is persisted.
