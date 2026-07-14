@@ -203,12 +203,22 @@ function createWindow() {
   wc.once('did-finish-load', () => {
     wc.executeJavaScript('Notification.requestPermission()').catch(() => {});
 
+    // Belt-and-suspenders session restore: re-inject from electron-store in case
+    // the page cleared localStorage after the preload ran.
+    const storedSession = store ? (store.get('supabase-session') ?? null) : null;
+    const storedJson = JSON.stringify(storedSession); // "null" or the session object
+
     // Intercept localStorage writes for the Supabase auth key so every
     // token change (login, refresh, sign-out) is persisted to electron-store.
     wc.executeJavaScript(`
       (() => {
         const KEY = 'sb-dpikisphgxwcysvvvltf-auth-token';
-        // Save whatever is already in localStorage (covers page-load restore).
+        // Re-inject stored session if the page doesn't already have one.
+        const stored = ${storedJson};
+        if (stored && !localStorage.getItem(KEY)) {
+          try { localStorage.setItem(KEY, JSON.stringify(stored)); } catch {}
+        }
+        // Save whatever is in localStorage now (persists the injected value).
         const cur = localStorage.getItem(KEY);
         if (cur) { try { window.electronAPI.saveSession(JSON.parse(cur)); } catch {} }
         // Intercept future writes.
@@ -517,6 +527,37 @@ app.whenReady().then(async () => {
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  });
+});
+
+// Explicitly save the Supabase session token before the process exits.
+// This is a safety net: even if the partition clears localStorage on quit,
+// electron-store survives and the preload will restore it on next launch.
+let isQuitting = false;
+app.on('before-quit', (event) => {
+  if (isQuitting) return;
+  event.preventDefault();
+  isQuitting = true;
+
+  const win = BrowserWindow.getAllWindows()[0];
+  if (!win || !store) { app.quit(); return; }
+
+  win.webContents.executeJavaScript(`
+    (() => {
+      try {
+        const v = localStorage.getItem('sb-dpikisphgxwcysvvvltf-auth-token');
+        return v ? JSON.parse(v) : null;
+      } catch { return null; }
+    })()
+  `).then(session => {
+    if (session) {
+      store.set('supabase-session', session);
+      console.log('[main] session saved before quit');
+    }
+  }).catch(err => {
+    console.error('[main] before-quit session save failed:', err.message);
+  }).finally(() => {
+    app.quit();
   });
 });
 
