@@ -550,9 +550,13 @@ app.on('before-quit', (event) => {
       } catch { return null; }
     })()
   `).then(session => {
+    const desc = session ? ('user=' + (session.user && session.user.email) + ' expires=' + session.expires_at) : 'null';
+    console.log('[main] before-quit localStorage read:', desc);
     if (session) {
       store.set('supabase-session', session);
-      console.log('[main] session saved before quit');
+      console.log('[main] before-quit electron-store saved: user=%s', session.user?.email);
+    } else {
+      console.warn('[main] before-quit no session in localStorage — nothing saved');
     }
   }).catch(err => {
     console.error('[main] before-quit session save failed:', err.message);
