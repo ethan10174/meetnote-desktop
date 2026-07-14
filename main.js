@@ -255,14 +255,11 @@ function createWindow() {
         const accessToken  = ${JSON.stringify(accessToken)};
         const refreshToken = ${JSON.stringify(refreshToken)};
 
-        if (accessToken && refreshToken) {
-          if (window.__supabase) {
-            window.__supabase.auth.setSession({ access_token: accessToken, refresh_token: refreshToken })
-              .then(() => console.log('[renderer] supabase.auth.setSession succeeded'))
-              .catch(e  => console.error('[renderer] supabase.auth.setSession failed:', e.message));
-          } else {
-            console.warn('[renderer] window.__supabase not available');
-          }
+        if (refreshToken) {
+          console.log('[renderer] dispatching meetnote:session-restored with refresh_token');
+          window.dispatchEvent(new CustomEvent('meetnote:session-restored', {
+            detail: { refresh_token: refreshToken },
+          }));
         } else {
           console.log('[renderer] no session to inject — user will see login screen');
         }
