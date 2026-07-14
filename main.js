@@ -203,25 +203,32 @@ function createWindow() {
   wc.once('did-finish-load', () => {
     wc.executeJavaScript('Notification.requestPermission()').catch(() => {});
 
-    // Belt-and-suspenders session restore: re-inject from electron-store in case
-    // the page cleared localStorage after the preload ran.
+    // Inject the persisted Supabase session from electron-store into localStorage
+    // now that all React components and Supabase listeners are initialized, then
+    // fire meetnote:session-restored so the renderer can call getSession() again.
     const storedSession = store ? (store.get('supabase-session') ?? null) : null;
     const storedJson = JSON.stringify(storedSession); // "null" or the session object
+    console.log('[main] did-finish-load session to inject:', storedSession ? ('user=' + (storedSession.user && storedSession.user.email)) : 'null');
 
-    // Intercept localStorage writes for the Supabase auth key so every
-    // token change (login, refresh, sign-out) is persisted to electron-store.
     wc.executeJavaScript(`
       (() => {
         const KEY = 'sb-dpikisphgxwcysvvvltf-auth-token';
-        // Re-inject stored session if the page doesn't already have one.
         const stored = ${storedJson};
-        if (stored && !localStorage.getItem(KEY)) {
-          try { localStorage.setItem(KEY, JSON.stringify(stored)); } catch {}
+        if (stored) {
+          try {
+            localStorage.setItem(KEY, JSON.stringify(stored));
+            console.log('[renderer] session injected into localStorage, dispatching meetnote:session-restored');
+            window.dispatchEvent(new Event('meetnote:session-restored'));
+          } catch (e) {
+            console.error('[renderer] session inject failed:', e.message);
+          }
+        } else {
+          console.log('[renderer] no stored session to inject');
         }
-        // Save whatever is in localStorage now (persists the injected value).
+        // Save whatever is in localStorage now (covers sessions already present).
         const cur = localStorage.getItem(KEY);
         if (cur) { try { window.electronAPI.saveSession(JSON.parse(cur)); } catch {} }
-        // Intercept future writes.
+        // Intercept future writes so every auth state change is persisted.
         const _set = Storage.prototype.setItem;
         Storage.prototype.setItem = function(k, v) {
           _set.call(this, k, v);
