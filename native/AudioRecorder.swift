@@ -48,14 +48,10 @@ final class Recorder: NSObject {
     private let sysLock = NSLock()
     private let micLock = NSLock()
 
-    private let sysTargetFmt: AVAudioFormat = AVAudioFormat(
-        commonFormat: .pcmFormatFloat32,
-        sampleRate: SAMPLE_RATE,
-        channels: AVAudioChannelCount(CHANNELS),
-        interleaved: false
-    )!
-    private var sysConverter: AVAudioConverter?
-    private var sysFirstFrame = true
+    // Actual sample rate delivered by SCStream (may differ from SAMPLE_RATE).
+    // Captured on the first audio frame and written into the WAV header.
+    private var sysSampleRate: Double = SAMPLE_RATE
+    private var sysFormatLogged  = false
 
     private var sysPath = ""
     private var micPath = ""
@@ -238,43 +234,46 @@ final class Recorder: NSObject {
     }
 
     private func writeSysBuffer(_ buf: AVAudioPCMBuffer, format: AVAudioFormat) {
-        if sysFirstFrame {
-            sysFirstFrame = false
-            log("[recorder] SCStream native format: \(format.sampleRate) Hz, \(format.channelCount) ch, interleaved=\(format.isInterleaved)")
-            let needsConversion = format.sampleRate != SAMPLE_RATE
-                || format.channelCount != AVAudioChannelCount(CHANNELS)
-                || format.isInterleaved
-            if needsConversion {
-                sysConverter = AVAudioConverter(from: format, to: sysTargetFmt)
-            }
+        if !sysFormatLogged {
+            sysFormatLogged = true
+            sysSampleRate   = format.sampleRate
+            log("[recorder] SCStream format: \(format.sampleRate) Hz, \(format.channelCount) ch, interleaved=\(format.isInterleaved)")
         }
 
-        let outBuf: AVAudioPCMBuffer
-        if let conv = sysConverter {
-            let ratio = SAMPLE_RATE / format.sampleRate
-            let cap = AVAudioFrameCount(Double(buf.frameLength) * ratio + 1)
-            guard let dest = AVAudioPCMBuffer(pcmFormat: sysTargetFmt, frameCapacity: cap) else { return }
-            var convError: NSError?
-            var inputConsumed = false
-            conv.convert(to: dest, error: &convError) { _, outStatus in
-                if inputConsumed { outStatus.pointee = .noDataNow; return nil }
-                inputConsumed = true; outStatus.pointee = .haveData; return buf
-            }
-            guard convError == nil else { return }
-            outBuf = dest
-        } else {
-            outBuf = buf
-        }
+        let frames = Int(buf.frameLength)
+        guard frames > 0 else { return }
 
-        guard let ch = outBuf.floatChannelData else { return }
-        let frames = Int(outBuf.frameLength)
-        let nch = min(Int(outBuf.format.channelCount), CHANNELS)
+        // Read via mutableAudioBufferList.mBuffers[i].mData rather than floatChannelData.
+        // On recent macOS, CMSampleBufferCopyPCMDataIntoAudioBufferList remaps mData to
+        // point directly into the CMSampleBuffer's own memory (zero-copy optimisation).
+        // floatChannelData caches the original allocation address and therefore reads zeros.
+        let ablPtr  = UnsafeMutableAudioBufferListPointer(buf.mutableAudioBufferList)
+        let nBufs   = ablPtr.count
+
         var interleaved = [Float](repeating: 0, count: frames * CHANNELS)
-        for f in 0..<frames {
+
+        if format.isInterleaved {
+            // Single buffer, samples ordered L0 R0 L1 R1 …
+            guard let data = ablPtr[0].mData else { return }
+            let src = data.assumingMemoryBound(to: Float.self)
+            let nch = Int(format.channelCount)
+            for f in 0..<frames {
+                for c in 0..<CHANNELS {
+                    interleaved[f * CHANNELS + c] = src[f * nch + (c < nch ? c : 0)]
+                }
+            }
+        } else {
+            // One buffer per channel: ablPtr[0] = L, ablPtr[1] = R …
+            let nch = min(nBufs, CHANNELS)
             for c in 0..<CHANNELS {
-                interleaved[f * CHANNELS + c] = ch[c < nch ? c : 0][f]
+                guard let data = ablPtr[c < nch ? c : 0].mData else { continue }
+                let src = data.assumingMemoryBound(to: Float.self)
+                for f in 0..<frames {
+                    interleaved[f * CHANNELS + c] = src[f]
+                }
             }
         }
+
         let bytes = interleaved.withUnsafeBytes { Data($0) }
         sysLock.lock(); sysHandle?.write(bytes); sysLock.unlock()
     }
@@ -305,7 +304,7 @@ final class Recorder: NSObject {
             pcm16[i] = Int16(mixed * 32767.0)
         }
 
-        let sr = Int(SAMPLE_RATE)
+        let sr = Int(sysSampleRate)
         let dataBytes = total * MemoryLayout<Int16>.size
 
         var hdr = Data()
