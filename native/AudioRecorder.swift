@@ -53,6 +53,13 @@ final class Recorder: NSObject {
     private var sysSampleRate: Double = SAMPLE_RATE
     private var sysFormatLogged  = false
 
+    // SCStream's first buffer(s) after startCapture() can carry a short run
+    // of unpopulated (zero) samples while the system audio tap attaches.
+    // Reset per stream start; bounded so it can only ever eat a startup
+    // glitch, never genuine mid-meeting silence.
+    private var sysTrimLeadingZeros = true
+    private var sysLeadingZerosTrimmed = 0
+
     private var sysPath = ""
     private var micPath = ""
     private var outputPath = ""
@@ -166,6 +173,9 @@ final class Recorder: NSObject {
         cfg.height = 2
         cfg.minimumFrameInterval = CMTime(value: 1, timescale: 1)
 
+        sysTrimLeadingZeros = true
+        sysLeadingZerosTrimmed = 0
+
         let stream = SCStream(filter: filter, configuration: cfg, delegate: self)
         try stream.addStreamOutput(self, type: .audio,
                                    sampleHandlerQueue: DispatchQueue(label: "mn.sysaudio"))
@@ -274,7 +284,36 @@ final class Recorder: NSObject {
             }
         }
 
-        let bytes = interleaved.withUnsafeBytes { Data($0) }
+        var startFrame = 0
+        if sysTrimLeadingZeros {
+            let maxTrimFrames = Int(sysSampleRate * 0.05)   // 50ms cap
+            while startFrame < frames && sysLeadingZerosTrimmed < maxTrimFrames {
+                var allZero = true
+                for c in 0..<CHANNELS where interleaved[startFrame * CHANNELS + c] != 0 {
+                    allZero = false
+                    break
+                }
+                if !allZero { break }
+                startFrame += 1
+                sysLeadingZerosTrimmed += 1
+            }
+            // Stop trimming once real audio is found or the cap is hit —
+            // whichever comes first — for the remainder of this stream.
+            if startFrame < frames || sysLeadingZerosTrimmed >= maxTrimFrames {
+                sysTrimLeadingZeros = false
+            }
+        }
+
+        let framesToWrite = frames - startFrame
+        guard framesToWrite > 0 else { return }
+
+        let bytes: Data
+        if startFrame == 0 {
+            bytes = interleaved.withUnsafeBytes { Data($0) }
+        } else {
+            let floatOffset = startFrame * CHANNELS
+            bytes = interleaved[floatOffset...].withUnsafeBufferPointer { Data(buffer: $0) }
+        }
         sysLock.lock(); sysHandle?.write(bytes); sysLock.unlock()
     }
 
