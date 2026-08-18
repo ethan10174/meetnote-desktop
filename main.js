@@ -77,7 +77,7 @@ async function uploadChunk(filePath, chunkIndex, meetingId, isFinal, userId) {
   return result;
 }
 
-// Wire up the chunk-ready event once (fires every 10 min during recording).
+// Wire up the chunk-ready event once (fires every 1 min during recording).
 // nativeBridge is an EventEmitter on mac/win; Linux stub has no .on.
 if (typeof nativeBridge.on === 'function') {
   nativeBridge.on('chunk-ready', ({ path: chunkPath, index }) => {
@@ -572,6 +572,87 @@ function checkAndNotify() {
   }
 }
 
+// ── Recover orphaned recordings from a previous failed/crashed session ────────
+// uploadChunk() only unlinks a chunk file after a successful upload, and
+// stop-recording only deletes the recording dir once the *final* chunk
+// upload succeeds — so a session where uploads failed (backend down,
+// network drop, app killed mid-recording) leaves its WAV chunks sitting in
+// <tmpdir>/<meetingId>/chunk-*.wav. On next launch, offer to re-upload them
+// instead of leaving that audio stranded and unrecoverable.
+function findOrphanedRecordings() {
+  const tmp = os.tmpdir();
+  let entries;
+  try { entries = fs.readdirSync(tmp, { withFileTypes: true }); } catch { return []; }
+
+  const orphans = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const dir = path.join(tmp, entry.name);
+    let files;
+    try { files = fs.readdirSync(dir); } catch { continue; }
+
+    const chunks = files.filter(f => /^chunk-\d+\.wav$/.test(f));
+    if (chunks.length === 0) continue;
+
+    let totalBytes = 0;
+    for (const f of chunks) {
+      try { totalBytes += fs.statSync(path.join(dir, f)).size; } catch {}
+    }
+    if (totalBytes === 0) continue;
+
+    orphans.push({ meetingId: entry.name, dir, chunks, totalBytes });
+  }
+  return orphans;
+}
+
+// Re-uploads every chunk for one orphaned recording, in order, marking the
+// last one final so the backend stitches/transcribes it the same way a
+// normal stop-recording final chunk would. Only cleans up the directory if
+// every chunk made it — a partial failure leaves the rest for next launch.
+async function recoverOrphanedRecording(orphan, userId) {
+  const indices = orphan.chunks
+    .map(f => parseInt(f.match(/^chunk-(\d+)\.wav$/)[1], 10))
+    .sort((a, b) => a - b);
+
+  console.log(`[recover] uploading ${indices.length} orphaned chunk(s) for ${orphan.meetingId} (${orphan.totalBytes} bytes)`);
+
+  for (let i = 0; i < indices.length; i++) {
+    const idx     = indices[i];
+    const isFinal = i === indices.length - 1;
+    await uploadChunk(path.join(orphan.dir, `chunk-${idx}.wav`), idx, orphan.meetingId, isFinal, userId);
+  }
+
+  fs.rm(orphan.dir, { recursive: true, force: true }, () => {});
+  console.log(`[recover] recovered ${orphan.meetingId}`);
+}
+
+async function recoverAllOrphans(orphans) {
+  const userId = store ? (store.get('supabase-session')?.user?.id ?? null) : null;
+  for (const orphan of orphans) {
+    try {
+      await recoverOrphanedRecording(orphan, userId);
+    } catch (err) {
+      console.error(`[recover] failed to recover ${orphan.meetingId}:`, err.message);
+    }
+  }
+}
+
+function offerRecoveryNotification(orphans) {
+  if (!Notification.isSupported()) return;
+
+  const totalMB = (orphans.reduce((s, o) => s + o.totalBytes, 0) / (1024 * 1024)).toFixed(1);
+  const n = new Notification({
+    title:    orphans.length === 1 ? 'Recording wasn’t fully uploaded' : `${orphans.length} recordings weren’t fully uploaded`,
+    subtitle: 'Tap to recover',
+    body:     `Found ${totalMB} MB of recorded audio that never reached the server. Tap to upload it now.`,
+    sound:    'default',
+    actions:  [{ type: 'button', text: 'Recover' }],
+  });
+  n.on('click',  () => recoverAllOrphans(orphans));
+  n.on('action', () => recoverAllOrphans(orphans));
+  n.show();
+}
+
 // ── App lifecycle ─────────────────────────────────────────────────────────────
 app.commandLine.appendSwitch('ignore-certificate-errors');
 app.commandLine.appendSwitch('disable-features', 'OutOfBlinkCors');
@@ -592,6 +673,12 @@ app.whenReady().then(async () => {
   }
 
   detectionInterval = setInterval(checkAndNotify, 30_000);
+
+  const orphans = findOrphanedRecordings();
+  if (orphans.length > 0) {
+    console.log(`[recover] found ${orphans.length} orphaned recording(s) at startup`);
+    offerRecoveryNotification(orphans);
+  }
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
