@@ -9,7 +9,7 @@
 //               so main.js can signal the renderer to use browser MediaRecorder
 //
 // Both bridges expose the same interface:
-//   startRecording(chunkDir)  → Promise<void>   starts recording; emits 'chunk-ready' every 10 min
+//   startRecording(chunkDir)  → Promise<void>   starts recording; emits 'chunk-ready' every 1 min
 //   stopRecording()           → Promise<{path, index}>   finalizes the last partial chunk
 //   shutdown()                → void
 //   Event 'chunk-ready'       → { path: string, index: number }
@@ -20,7 +20,12 @@ const readline     = require('readline');
 const fs           = require('fs');
 const EventEmitter = require('events');
 
-const CHUNK_DURATION_MS = 10 * 60 * 1000;
+// Shorter roll interval bounds how much unprocessed audio "stop" can land on
+// — the segment still recording when the user stops is uploaded as the final
+// chunk and has to be transcribed before the summary can be generated, so
+// keeping it short (rather than the previous 10 min) is what makes summaries
+// ready within seconds of stopping instead of minutes.
+const CHUNK_DURATION_MS = 60 * 1000;
 
 // ── macOS bridge (Swift binary via stdin/stdout JSON protocol) ────────────────
 

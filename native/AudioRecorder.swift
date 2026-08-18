@@ -48,10 +48,25 @@ final class Recorder: NSObject {
     private let sysLock = NSLock()
     private let micLock = NSLock()
 
-    // Actual sample rate delivered by SCStream (may differ from SAMPLE_RATE).
-    // Captured on the first audio frame and written into the WAV header.
+    // Actual sample rate delivered by SCStream (may differ from SAMPLE_RATE
+    // — SCStreamConfiguration.sampleRate is a request, not a guarantee, and
+    // ScreenCaptureKit is free to deliver at the device's native rate
+    // instead). Tracked for diagnostics only now; see sysConverter below for
+    // why it's no longer what gets written into the WAV header.
     private var sysSampleRate: Double = SAMPLE_RATE
     private var sysFormatLogged  = false
+
+    // Converts system-audio buffers to SAMPLE_RATE/CHANNELS when SCStream's
+    // actual delivered format differs, mirroring the converter startMic()
+    // already builds for the mic path. Without this, writeSysBuffer's system
+    // PCM (at whatever rate SCStream actually used) and writeMicBuffer's mic
+    // PCM (always resampled to SAMPLE_RATE) were being mixed sample-index by
+    // sample-index in mix() as if they shared one clock. Whichever stream's
+    // native rate was slower ended up compressed into fewer output samples
+    // than its real duration, so it played back sped up — audible as the
+    // whole recording's pitch being too high. Built lazily on the first
+    // buffer, once the actual delivered format is known.
+    private var sysConverter: AVAudioConverter?
 
     // SCStream's first buffer(s) after startCapture() can carry a short run
     // of unpopulated (zero) samples while the system audio tap attaches.
@@ -243,11 +258,42 @@ final class Recorder: NSObject {
         micLock.lock(); micHandle?.write(bytes); micLock.unlock()
     }
 
-    private func writeSysBuffer(_ buf: AVAudioPCMBuffer, format: AVAudioFormat) {
+    private func writeSysBuffer(_ rawBuf: AVAudioPCMBuffer, format rawFormat: AVAudioFormat) {
         if !sysFormatLogged {
             sysFormatLogged = true
-            sysSampleRate   = format.sampleRate
-            log("[recorder] SCStream format: \(format.sampleRate) Hz, \(format.channelCount) ch, interleaved=\(format.isInterleaved)")
+            sysSampleRate   = rawFormat.sampleRate
+            log("[recorder] SCStream format: \(rawFormat.sampleRate) Hz, \(rawFormat.channelCount) ch, interleaved=\(rawFormat.isInterleaved)")
+
+            if rawFormat.sampleRate != SAMPLE_RATE || rawFormat.channelCount != AVAudioChannelCount(CHANNELS) {
+                let targetFmt = AVAudioFormat(
+                    commonFormat: .pcmFormatFloat32,
+                    sampleRate: SAMPLE_RATE,
+                    channels: AVAudioChannelCount(CHANNELS),
+                    interleaved: rawFormat.isInterleaved
+                )!
+                sysConverter = AVAudioConverter(from: rawFormat, to: targetFmt)
+                log("[recorder] SCStream format differs from target \(SAMPLE_RATE) Hz / \(CHANNELS) ch — converting system audio before mixing")
+            }
+        }
+
+        var buf = rawBuf
+        var format = rawFormat
+        if let conv = sysConverter {
+            let ratio = SAMPLE_RATE / rawFormat.sampleRate
+            let cap = AVAudioFrameCount(Double(rawBuf.frameLength) * ratio + 1)
+            guard let dest = AVAudioPCMBuffer(pcmFormat: conv.outputFormat, frameCapacity: cap) else { return }
+            var convError: NSError?
+            var inputConsumed = false
+            conv.convert(to: dest, error: &convError) { _, outStatus in
+                if inputConsumed { outStatus.pointee = .noDataNow; return nil }
+                inputConsumed = true; outStatus.pointee = .haveData; return rawBuf
+            }
+            guard convError == nil else {
+                log("[recorder] sys audio conversion failed: \(convError!.localizedDescription)")
+                return
+            }
+            buf = dest
+            format = conv.outputFormat
         }
 
         let frames = Int(buf.frameLength)
@@ -286,7 +332,10 @@ final class Recorder: NSObject {
 
         var startFrame = 0
         if sysTrimLeadingZeros {
-            let maxTrimFrames = Int(sysSampleRate * 0.05)   // 50ms cap
+            // frames (and therefore this cap) are counted at SAMPLE_RATE —
+            // buf has already been converted to that rate above, even though
+            // SCStream may have delivered it at sysSampleRate originally.
+            let maxTrimFrames = Int(SAMPLE_RATE * 0.05)   // 50ms cap
             while startFrame < frames && sysLeadingZerosTrimmed < maxTrimFrames {
                 var allZero = true
                 for c in 0..<CHANNELS where interleaved[startFrame * CHANNELS + c] != 0 {
@@ -343,7 +392,14 @@ final class Recorder: NSObject {
             pcm16[i] = Int16(mixed * 32767.0)
         }
 
-        let sr = Int(sysSampleRate)
+        // Both streams are guaranteed to be at SAMPLE_RATE by this point —
+        // mic via startMic()'s converter, sys via writeSysBuffer's
+        // sysConverter above — so the header must declare that fixed rate,
+        // not the raw sysSampleRate SCStream happened to deliver at (which
+        // is what caused the pitch bug: sys and mic were being mixed
+        // sample-index by sample-index while at two different real rates,
+        // then the whole mix was labeled with only one of those rates).
+        let sr = Int(SAMPLE_RATE)
         let dataBytes = total * MemoryLayout<Int16>.size
 
         var hdr = Data()
