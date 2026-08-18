@@ -86,7 +86,13 @@ if (typeof nativeBridge.on === 'function') {
     console.log(`[main] chunk-ready: index=${index} path=${chunkPath}`);
     uploadChunk(chunkPath, index, meetingId, false, null)
       .then(r  => console.log(`[main] chunk ${index} uploaded:`, Object.keys(r)))
-      .catch(err => console.error(`[main] chunk ${index} upload failed:`, err.message));
+      .catch(err => {
+        console.error(`[main] chunk ${index} upload failed:`, err.message);
+        const win = BrowserWindow.getAllWindows()[0];
+        if (win) {
+          win.webContents.send('chunk-upload-error', { meetingId, index, message: err.message });
+        }
+      });
   });
 }
 
@@ -384,8 +390,19 @@ let currentMeetingId    = null;
 
 ipcMain.handle('start-recording', async (_event, { meetingId } = {}) => {
   console.log('[main] start-recording received at', Date.now());
+
+  // Recording must be tagged with the real Supabase meeting UUID from the
+  // start. A synthetic fallback ID here would let the recording proceed
+  // while silently orphaning every chunk from the meeting row that's
+  // actually shown in the UI — that mismatch is what let a full 28-minute
+  // recording upload successfully yet never show up against the meeting.
+  if (!meetingId) {
+    console.error('[start-recording] refused — no meeting ID provided by renderer');
+    throw new Error('No meeting ID yet — recording cannot start until the meeting is confirmed.');
+  }
+
   try {
-    currentMeetingId    = meetingId || `meeting-${Date.now()}`;
+    currentMeetingId    = meetingId;
     currentRecordingDir = path.join(os.tmpdir(), currentMeetingId);
     fs.mkdirSync(currentRecordingDir, { recursive: true });
     await nativeBridge.startRecording(currentRecordingDir);

@@ -27,4 +27,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getAppVersion: () => ipcRenderer.invoke('get-app-version'),
 
   readFileBuffer: (filePath) => ipcRenderer.invoke('read-file-buffer', filePath),
+
+  // Fires when a background chunk upload fails during an active recording,
+  // so the UI can surface it instead of the recording silently losing audio.
+  onChunkUploadError: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on('chunk-upload-error', listener);
+    return () => ipcRenderer.removeListener('chunk-upload-error', listener);
+  },
 });
