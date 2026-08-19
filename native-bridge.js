@@ -96,10 +96,13 @@ class MacBridge extends EventEmitter {
     if (msg.status === 'error') throw new Error(msg.message);
   }
 
-  // Stop the current chunk, return its finalized path.
-  async _stopCurrentChunk() {
+  // Stop the current chunk, return its finalized path. `final` tells the
+  // helper whether to tear down the capture stream/mic engine (true, real
+  // end of recording) or leave them running for the next chunk to reuse
+  // (false, mid-recording rotation) — see AudioRecorder.swift.
+  async _stopCurrentChunk(final = false) {
     const pending = this._nextMessage(60_000);
-    this._proc.stdin.write(JSON.stringify({ cmd: 'stop' }) + '\n');
+    this._proc.stdin.write(JSON.stringify({ cmd: 'stop', final }) + '\n');
     const msg = await pending;
     if (msg.status === 'error') throw new Error(msg.message);
     return msg.path;
@@ -138,7 +141,7 @@ class MacBridge extends EventEmitter {
 
   async startRecording(chunkDir) {
     this._chunkDir   = chunkDir;
-    this._chunkIndex = 1;
+    this._chunkIndex = 0;
     this._ensureProcess();
     await this._startChunk();
     this._chunkTimer = setTimeout(() => this._rollChunk(), CHUNK_DURATION_MS);
@@ -152,7 +155,7 @@ class MacBridge extends EventEmitter {
     if (!this._proc) throw new Error('No active recording process');
 
     const finalIndex = this._chunkIndex;
-    const finalPath  = await this._stopCurrentChunk();
+    const finalPath  = await this._stopCurrentChunk(true);
 
     this._chunkDir   = null;
     this._chunkIndex = 0;
@@ -359,13 +362,13 @@ class WinBridge extends EventEmitter {
     }
 
     this._chunkDir       = chunkDir;
-    this._chunkIndex     = 1;
+    this._chunkIndex     = 0;
     this._captureBinPath = captureBin;
     this._ffmpegBinPath  = ffmpegBin;
     this._micDevice      = await this._findDefaultMic(ffmpegBin);
 
     try {
-      await this._spawnChunk(this._chunkPath(1));
+      await this._spawnChunk(this._chunkPath(this._chunkIndex));
     } catch (err) {
       console.error('[win-bridge] startRecording failed:', err.message);
       const e = new Error(err.message);

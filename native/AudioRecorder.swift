@@ -2,9 +2,18 @@
 // Captures system audio (ScreenCaptureKit) + microphone (AVAudioEngine),
 // mixes them, and writes a WAV file when recording stops.
 //
+// The capture stream and mic engine run continuously for the life of one
+// recording, independent of chunk rotation: "start" only opens a new pair
+// of raw file handles and installs them for writeSysBuffer/writeMicBuffer
+// to write into, and "stop" only detaches and mixes the current pair. The
+// underlying SCStream/AVAudioEngine are stood up on the first "start" of a
+// recording and only torn down on a "stop" with "final":true — rotation
+// never restarts capture, so it can't retrigger ScreenCaptureKit's startup
+// attach glitch (see sysTrimLeadingZeros below) on every chunk boundary.
+//
 // IPC protocol (stdin → stdout, one JSON object per line):
 //   Input:  {"cmd":"start","output":"/tmp/recording.wav"}
-//   Input:  {"cmd":"stop"}
+//   Input:  {"cmd":"stop","final":false}
 //   Input:  {"cmd":"quit"}
 //   Output: {"status":"started"}
 //   Output: {"status":"stopped","path":"/tmp/recording.wav"}
@@ -85,83 +94,127 @@ final class Recorder: NSObject {
         outputPath = output
 
         let tmp = NSTemporaryDirectory()
-        sysPath = tmp + "mn-sys-\(UInt64.random(in: 0..<UInt64.max)).raw"
-        micPath = tmp + "mn-mic-\(UInt64.random(in: 0..<UInt64.max)).raw"
+        let newSysPath = tmp + "mn-sys-\(UInt64.random(in: 0..<UInt64.max)).raw"
+        let newMicPath = tmp + "mn-mic-\(UInt64.random(in: 0..<UInt64.max)).raw"
 
-        guard FileManager.default.createFile(atPath: sysPath, contents: nil),
-              FileManager.default.createFile(atPath: micPath, contents: nil) else {
+        guard FileManager.default.createFile(atPath: newSysPath, contents: nil),
+              FileManager.default.createFile(atPath: newMicPath, contents: nil) else {
             emit(["status": "error", "message": "Cannot create temp audio files"])
             return
         }
 
+        let newSysHandle: FileHandle
+        let newMicHandle: FileHandle
         do {
-            sysHandle = try FileHandle(forWritingTo: URL(fileURLWithPath: sysPath))
-            micHandle = try FileHandle(forWritingTo: URL(fileURLWithPath: micPath))
+            newSysHandle = try FileHandle(forWritingTo: URL(fileURLWithPath: newSysPath))
+            newMicHandle = try FileHandle(forWritingTo: URL(fileURLWithPath: newMicPath))
         } catch {
             emit(["status": "error", "message": "Cannot open temp files: \(error.localizedDescription)"])
+            removeFiles(newSysPath, newMicPath)
             return
         }
 
-        do {
-            try await startSCStream()
-        } catch {
-            emit(["status": "error", "message": "ScreenCaptureKit: \(error.localizedDescription)"])
-            cleanup()
-            return
-        }
+        // Install the new pair immediately, under lock. writeSysBuffer /
+        // writeMicBuffer only ever see a fully-open handle or nil — never a
+        // half-swapped state — so capture can keep running across this swap.
+        installHandles(sys: newSysHandle, mic: newMicHandle)
+        sysPath = newSysPath
+        micPath = newMicPath
 
-        do {
-            try startMic()
-        } catch {
-            // Non-fatal — continue with system audio only
-            log("[recorder] Mic unavailable: \(error.localizedDescription)")
+        // Capture only needs to be stood up once per recording. Later chunks
+        // reuse the already-running stream/engine instead of restarting them,
+        // so rotation can never retrigger the SCStream attach glitch that
+        // sysTrimLeadingZeros exists to paper over.
+        if scStream == nil {
+            do {
+                try await startSCStream()
+            } catch {
+                emit(["status": "error", "message": "ScreenCaptureKit: \(error.localizedDescription)"])
+                let (s, m) = detachHandles()
+                s?.closeFile(); m?.closeFile()
+                removeFiles(newSysPath, newMicPath)
+                return
+            }
+
+            do {
+                try startMic()
+            } catch {
+                // Non-fatal — continue with system audio only
+                log("[recorder] Mic unavailable: \(error.localizedDescription)")
+            }
         }
 
         emit(["status": "started"])
     }
 
-    func stop() async {
-        // Stop synchronous resources before the async stopCapture call
-        stopMicSync()
-        let streamToStop = scStream
-        scStream = nil
+    func stop(final: Bool) async {
+        // Detach the handles this chunk was writing to so a new pair can be
+        // installed by the next start() right away, and so mix() below reads
+        // a stable, fully-flushed pair of raw files. Capture itself keeps
+        // running unless this is the final stop — writeSysBuffer/
+        // writeMicBuffer just see nil handles and skip writes until the next
+        // start() installs a new pair.
+        let (finishedSysHandle, finishedMicHandle) = detachHandles()
+        finishedSysHandle?.closeFile()
+        finishedMicHandle?.closeFile()
 
-        if let s = streamToStop {
-            try? await s.stopCapture()
+        let finishedSysPath    = sysPath
+        let finishedMicPath    = micPath
+        let finishedOutputPath = outputPath
+
+        if final {
+            stopEngineSync()
+            let streamToStop = scStream
+            scStream = nil
+            if let s = streamToStop {
+                try? await s.stopCapture()
+            }
         }
-        closeSysHandleSync()
 
         // Diagnostic: log raw capture sizes so we can tell whether audio arrived.
         // sysBytes == 0 means SCStream delivered no audio frames (permission or
         // filter problem). micBytes == 0 means AVAudioEngine tap got nothing.
-        let sysBytes = (try? FileManager.default.attributesOfItem(atPath: sysPath)[.size] as? Int) ?? 0
-        let micBytes = (try? FileManager.default.attributesOfItem(atPath: micPath)[.size] as? Int) ?? 0
+        let sysBytes = (try? FileManager.default.attributesOfItem(atPath: finishedSysPath)[.size] as? Int) ?? 0
+        let micBytes = (try? FileManager.default.attributesOfItem(atPath: finishedMicPath)[.size] as? Int) ?? 0
         log("[recorder] raw capture — sys: \(sysBytes) bytes, mic: \(micBytes) bytes")
 
         // Mix and write WAV
         do {
-            try mix(to: outputPath)
-            let wavBytes = (try? FileManager.default.attributesOfItem(atPath: outputPath)[.size] as? Int) ?? 0
-            log("[recorder] WAV written: \(wavBytes) bytes → \(outputPath)")
-            emit(["status": "stopped", "path": outputPath])
+            try mix(sysPath: finishedSysPath, micPath: finishedMicPath, to: finishedOutputPath)
+            let wavBytes = (try? FileManager.default.attributesOfItem(atPath: finishedOutputPath)[.size] as? Int) ?? 0
+            log("[recorder] WAV written: \(wavBytes) bytes → \(finishedOutputPath)")
+            emit(["status": "stopped", "path": finishedOutputPath])
         } catch {
             emit(["status": "error", "message": "WAV write failed: \(error.localizedDescription)"])
         }
 
-        cleanup()
+        removeFiles(finishedSysPath, finishedMicPath)
     }
 
     // MARK: Private — sync teardown helpers (avoids NSLock-in-async warnings)
 
-    private func stopMicSync() {
+    private func stopEngineSync() {
         engine?.inputNode.removeTap(onBus: 0)
         engine?.stop()
         engine = nil
-        micLock.lock(); micHandle?.closeFile(); micHandle = nil; micLock.unlock()
     }
 
-    private func closeSysHandleSync() {
-        sysLock.lock(); sysHandle?.closeFile(); sysHandle = nil; sysLock.unlock()
+    private func installHandles(sys: FileHandle, mic: FileHandle) {
+        sysLock.lock(); sysHandle = sys; sysLock.unlock()
+        micLock.lock(); micHandle = mic; micLock.unlock()
+    }
+
+    // Detaches whatever handles are currently installed and returns them,
+    // leaving sysHandle/micHandle nil so any in-flight write callback just
+    // no-ops until the next start() installs a fresh pair.
+    private func detachHandles() -> (FileHandle?, FileHandle?) {
+        sysLock.lock(); let s = sysHandle; sysHandle = nil; sysLock.unlock()
+        micLock.lock(); let m = micHandle; micHandle = nil; micLock.unlock()
+        return (s, m)
+    }
+
+    private func removeFiles(_ paths: String...) {
+        for p in paths { try? FileManager.default.removeItem(atPath: p) }
     }
 
     // MARK: Private — capture setup
@@ -368,7 +421,7 @@ final class Recorder: NSObject {
 
     // MARK: Private — WAV mixing
 
-    private func mix(to path: String) throws {
+    private func mix(sysPath: String, micPath: String, to path: String) throws {
         let sysData = (try? Data(contentsOf: URL(fileURLWithPath: sysPath))) ?? Data()
         let micData = (try? Data(contentsOf: URL(fileURLWithPath: micPath))) ?? Data()
 
@@ -494,13 +547,14 @@ if #available(macOS 13.0, *) {
         while let line = readLine(strippingNewline: true) {
             guard !line.isEmpty,
                   let data = line.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: String] else { continue }
-            let cmd = json["cmd"] ?? ""
-            let output = json["output"] ?? ""
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+            let cmd = json["cmd"] as? String ?? ""
+            let output = json["output"] as? String ?? ""
+            let final = json["final"] as? Bool ?? false
             Task {
                 switch cmd {
                 case "start": await recorder.start(output: output)
-                case "stop":  await recorder.stop()
+                case "stop":  await recorder.stop(final: final)
                 case "quit":  exit(0)
                 default:      emit(["status": "error", "message": "Unknown command: \(cmd)"])
                 }
