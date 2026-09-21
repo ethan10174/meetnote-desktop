@@ -12,7 +12,6 @@
   "build": {
     "appId": "com.meetnote.app",
     "productName": "MeetNote",
-    "afterSign": "notarize.js",
     "directories": {
       "output": "dist"
     },
@@ -44,7 +43,7 @@
       "icon": "icon.icns",
       "target": [
         {
-          "target": "dmg",
+          "target": "dir",
           "arch": [
             "arm64"
           ]

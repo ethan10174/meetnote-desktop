@@ -40,19 +40,42 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
           echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> $GITHUB_ENV
 
-      - name: Build and sign DMG
+      - name: Build unsigned app
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm run dist
+
+      - name: Code sign app
+        run: |
+          APP_PATH=$(find dist -maxdepth 3 -name "*.app" | head -1)
+          echo "APP_PATH=$APP_PATH" >> $GITHUB_ENV
+          codesign --force --deep --options runtime --timestamp \
+            --entitlements entitlements.mac.plist \
+            --sign "ETHAN ALLISON (GMVTGR644V)" \
+            --keychain "$KEYCHAIN_PATH" \
+            "$APP_PATH"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+
+      - name: Create DMG
+        run: |
+          DMG_SRC=dist/dmg-src
+          mkdir -p "$DMG_SRC"
+          cp -R "$APP_PATH" "$DMG_SRC/"
+          ln -s /Applications "$DMG_SRC/Applications"
+          hdiutil create -volname "MeetNote" -srcfolder "$DMG_SRC" -ov -format UDZO dist/MeetNote.dmg
+
+      - name: Notarize DMG
         env:
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          CSC_LINK: ${{ secrets.CSC_LINK }}
-          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
-          CSC_KEYCHAIN: ${{ env.KEYCHAIN_PATH }}
-          KEYCHAIN_PATH: ${{ env.KEYCHAIN_PATH }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CSC_FOR_PULL_REQUEST: 'true'
-          TIMESTAMP_SERVER: 'http://timestamp.apple.com/ts01'
-          ELECTRON_BUILDER_SIGN_TIMEOUT: '120000'
-        run: npm run dist
+        run: |
+          xcrun notarytool submit dist/MeetNote.dmg \
+            --key "$APPLE_API_KEY" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER" \
+            --wait
+          xcrun stapler staple dist/MeetNote.dmg
 
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
