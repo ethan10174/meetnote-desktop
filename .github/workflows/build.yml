@@ -46,6 +46,8 @@ jobs:
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           CSC_LINK: ${{ secrets.CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          CSC_KEYCHAIN: ${{ env.KEYCHAIN_PATH }}
+          KEYCHAIN_PATH: ${{ env.KEYCHAIN_PATH }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CSC_FOR_PULL_REQUEST: 'true'
           TIMESTAMP_SERVER: 'http://timestamp.apple.com/ts01'
