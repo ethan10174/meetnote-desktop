@@ -27,6 +27,19 @@ jobs:
           echo '${{ secrets.APPLE_API_KEY }}' > /tmp/AuthKey.p8
           echo 'APPLE_API_KEY=/tmp/AuthKey.p8' >> $GITHUB_ENV
 
+      - name: Import certificate
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          echo "${{ secrets.CSC_LINK }}" | base64 --decode > /tmp/certificate.p12
+          security import /tmp/certificate.p12 -k $KEYCHAIN_PATH -P "${{ secrets.CSC_KEY_PASSWORD }}" -T /usr/bin/codesign
+          security list-keychain -d user -s $KEYCHAIN_PATH
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> $GITHUB_ENV
+
       - name: Build and sign DMG
         env:
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
