@@ -1,4 +1,4 @@
-const { contextBridge, ipcRenderer } = require('electron');
+const { contextBridge, ipcRenderer, shell } = require('electron');
 
 // Audio capture is now handled entirely in the main process via the native
 // ScreenCaptureKit bridge (native-bridge.js + resources/audio-recorder).
@@ -25,6 +25,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getScreenRecordingStatus: () => ipcRenderer.invoke('get-screen-recording-status'),
 
   getAppVersion: () => ipcRenderer.invoke('get-app-version'),
+
+  openExternal: (url) => shell.openExternal(url),
 
   readFileBuffer: (filePath) => ipcRenderer.invoke('read-file-buffer', filePath),
 
