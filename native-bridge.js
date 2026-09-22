@@ -177,24 +177,33 @@ class MacBridge extends EventEmitter {
 // audio_capture.exe (WASAPI loopback) → raw PCM stdout
 //   → piped into ffmpeg stdin as s16le 44100 2ch (system audio)
 //   + ffmpeg DirectShow mic input (best-effort; omitted if no mic found)
-//   → WAV chunk file on disk
+//   → rotating WAV chunk files on disk
 //
-// Rolling: kill audio_capture → its stdout EOF propagates to ffmpeg stdin →
-// ffmpeg finalises the WAV header and exits cleanly. Then spawn fresh pair.
-
+// Rolling: audio_capture.exe and ffmpeg are both spawned ONCE per recording
+// and stay alive the whole time — we never kill/respawn either mid-recording.
+// ffmpeg's own `-f segment` muxer splits the single continuous PCM stream
+// into chunk-N.wav files internally, so there's no capture gap at chunk
+// boundaries (matching the Mac bridge, which keeps its ScreenCaptureKit/
+// AVAudioEngine stream alive across rotation and only swaps the output
+// file — see AudioRecorder.swift). We detect each finalized segment via
+// `-segment_list` (+ `live` flag): ffmpeg appends a line to that file the
+// moment a segment's WAV header is fully written and closed — not stderr
+// log scraping, which would depend on log verbosity we don't control.
 class WinBridge extends EventEmitter {
   constructor() {
     super();
-    this._captureProc    = null;
-    this._ffmpegProc     = null;
-    this._chunkDir       = null;
-    this._chunkIndex     = 0;
-    this._chunkTimer     = null;
-    this._activeRoll     = null;
-    // Cached on first startRecording so rolls don't re-enumerate.
-    this._captureBinPath = null;
-    this._ffmpegBinPath  = null;
-    this._micDevice      = null;
+    this._captureProc     = null;
+    this._ffmpegProc      = null;
+    this._chunkDir        = null;
+    this._segmentListPath = null;
+    this._listWatcher     = null;
+    this._processedLines  = 0;  // list lines already claimed by _readNewSegments
+    this._emittedIndex    = 0;  // next index to assign to a regular chunk-ready
+    this._pendingFinal    = []; // segment(s) that closed after stopRecording began
+    this._stopping        = false;
+    this._captureBinPath  = null;
+    this._ffmpegBinPath   = null;
+    this._micDevice       = null;
   }
 
   // Locate audio_capture.exe: resources folder (packaged) or native/ subdir (dev).
@@ -245,40 +254,105 @@ class WinBridge extends EventEmitter {
     });
   }
 
-  _chunkPath(n) {
-    return path.join(this._chunkDir, `chunk-${n}.wav`);
+  // Read any segment-list lines we haven't claimed yet. Synchronous (no
+  // await between the read and the counter bump) so this is safe to call
+  // from both the directory watcher and stopRecording() without a race —
+  // whichever call runs first atomically claims the new line(s).
+  _readNewSegments() {
+    let lines = [];
+    try {
+      lines = fs.readFileSync(this._segmentListPath, 'utf8')
+        .split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    } catch {
+      return [];
+    }
+    const newLines = lines.slice(this._processedLines);
+    this._processedLines = lines.length;
+    return newLines;
   }
 
-  // Spawn audio_capture.exe + ffmpeg for a single chunk output file.
-  // Resolves when ffmpeg signals it is actively recording.
-  _spawnChunk(outputPath) {
+  // Fired on every directory change and once explicitly after stopRecording
+  // kills capture. Before stopRecording begins, newly-closed segments are
+  // regular chunk-ready events. Once it's begun, any segment that closes as
+  // a *result* of that stop is the final chunk, which stopRecording()
+  // returns directly instead — buffer it there rather than emitting it.
+  _onListUpdated() {
+    for (const line of this._readNewSegments()) {
+      if (this._stopping) {
+        this._pendingFinal.push(line);
+        continue;
+      }
+      const idx = this._emittedIndex++;
+      let fileSize = 0;
+      try { fileSize = fs.statSync(line).size; } catch {}
+      console.log(`[win-bridge] chunk ${idx} finalized — ${fileSize} bytes`);
+      this.emit('chunk-ready', { path: line, index: idx });
+    }
+  }
+
+  // Spawn audio_capture.exe + ffmpeg once for the whole recording. ffmpeg's
+  // segment muxer handles chunk rotation internally — no process restarts.
+  // Resolves once ffmpeg's progress stats confirm it's actively recording
+  // (or after a timeout fallback).
+  _spawnPersistent() {
     const captureBin = this._captureBinPath;
     const ffmpegBin  = this._ffmpegBinPath;
     const mic        = this._micDevice;
+    const segmentPattern = path.join(this._chunkDir, 'chunk-%d.wav');
+    this._segmentListPath = path.join(this._chunkDir, 'segments.list');
 
     this._captureProc = spawn(captureBin, [
       '--sample-rate', '44100', '--channels', '2', '--bit-depth', '16',
     ], { stdio: ['ignore', 'pipe', 'pipe'] });
     this._captureProc.stderr.on('data', d => process.stderr.write('[audio_capture] ' + d));
 
+    const segmentArgs = [
+      '-f', 'segment',
+      '-segment_time', String(CHUNK_DURATION_MS / 1000),
+      '-segment_start_number', '0',
+      '-reset_timestamps', '1',
+      '-strftime', '0',
+      '-segment_list', this._segmentListPath,
+      '-segment_list_type', 'flat',
+      '-segment_list_flags', 'live',
+      '-y', segmentPattern,
+    ];
     const ffmpegArgs = mic ? [
       '-f', 's16le', '-ar', '44100', '-ac', '2', '-i', 'pipe:0',
       '-f', 'dshow', '-i', `audio=${mic}`,
       '-filter_complex', 'amix=inputs=2:duration=first',
       '-acodec', 'pcm_s16le', '-ar', '44100', '-ac', '2',
-      '-y', outputPath,
+      ...segmentArgs,
     ] : [
       '-f', 's16le', '-ar', '44100', '-ac', '2', '-i', 'pipe:0',
       '-acodec', 'pcm_s16le', '-ar', '44100', '-ac', '2',
-      '-y', outputPath,
+      ...segmentArgs,
     ];
 
-    console.log(`[win-bridge] spawning chunk → ${outputPath}${mic ? ' (+ mic)' : ''}`);
+    console.log(`[win-bridge] starting persistent capture → ${segmentPattern}${mic ? ' (+ mic)' : ''}`);
     this._ffmpegProc = spawn(ffmpegBin, ffmpegArgs, { stdio: ['pipe', 'ignore', 'pipe'] });
     this._ffmpegProc.stdin.on('error', (err) => {
       console.error('[win-bridge] ffmpeg stdin error (EPIPE suppressed):', err.message);
     });
     this._captureProc.stdout.pipe(this._ffmpegProc.stdin);
+
+    this._ffmpegProc.on('exit', (code, sig) => {
+      this._ffmpegProc = null;
+      if (!this._stopping) {
+        console.error(`[win-bridge] ffmpeg exited unexpectedly (code=${code}, signal=${sig})`);
+      }
+    });
+
+    // Watch the chunk directory (rather than the list file directly) so we
+    // don't race ffmpeg creating segments.list for the first time.
+    try {
+      this._listWatcher = fs.watch(this._chunkDir, (_eventType, filename) => {
+        if (filename && filename !== path.basename(this._segmentListPath)) return;
+        this._onListUpdated();
+      });
+    } catch (err) {
+      console.error('[win-bridge] failed to watch chunk dir:', err.message);
+    }
 
     return new Promise((resolve, reject) => {
       let resolved = false;
@@ -291,72 +365,12 @@ class WinBridge extends EventEmitter {
       });
       this._captureProc.on('error', done);
       this._ffmpegProc.on('error', done);
-      this._ffmpegProc.on('exit', (code, sig) => {
-        this._ffmpegProc = null;
+      this._ffmpegProc.once('exit', (code, sig) => {
         done(new Error(`ffmpeg exited before recording started (code=${code}, signal=${sig})`));
       });
       // Resolve after 8 s regardless — some builds don't print the ready line.
       setTimeout(() => done(), 8_000);
     });
-  }
-
-  // Gracefully stop the current chunk: kill audio_capture → EOF → ffmpeg writes WAV trailer.
-  //
-  // Captures the ffmpeg process reference up front rather than reading
-  // this._ffmpegProc from the timeout closure — by the time a fallback
-  // fires, the next chunk's roll may already have reassigned that field to
-  // a brand-new process, and killing "whatever this._ffmpegProc is now"
-  // would cut the next chunk short instead of the one being stopped.
-  _stopCurrentChunk() {
-    return new Promise(resolve => {
-      const proc = this._ffmpegProc;
-      let hardKill;
-      const finish = () => { clearTimeout(hardKill); resolve(); };
-
-      if (proc) {
-        proc.once('exit', () => {
-          if (this._ffmpegProc === proc) this._ffmpegProc = null;
-          finish();
-        });
-      } else {
-        finish();
-      }
-      try { this._captureProc?.kill(); } catch {}
-      this._captureProc = null;
-      try { proc?.stdin?.end(); } catch {}
-      // Hard-kill fallback after 10 s.
-      hardKill = setTimeout(() => { try { proc?.kill(); } catch {} finish(); }, 10_000);
-    });
-  }
-
-  _rollChunk() {
-    if (this._activeRoll) return; // re-entry guard
-    this._activeRoll = this._doRoll().finally(() => { this._activeRoll = null; });
-  }
-
-  async _doRoll() {
-    const finishedPath  = this._chunkPath(this._chunkIndex);
-    const finishedIndex = this._chunkIndex;
-
-    await this._stopCurrentChunk();
-
-    let fileSize = 0;
-    try { fileSize = fs.statSync(finishedPath).size; } catch {}
-    console.log(`[win-bridge] chunk ${finishedIndex} finalized — ${fileSize} bytes`);
-
-    this._chunkIndex++;
-
-    // Emit before spawning next chunk so upload starts in parallel with next chunk startup.
-    this.emit('chunk-ready', { path: finishedPath, index: finishedIndex });
-
-    try {
-      await this._spawnChunk(this._chunkPath(this._chunkIndex));
-    } catch (err) {
-      console.error('[win-bridge] error starting next chunk:', err.message);
-      return;
-    }
-
-    this._chunkTimer = setTimeout(() => this._rollChunk(), CHUNK_DURATION_MS);
   }
 
   async startRecording(chunkDir) {
@@ -374,34 +388,69 @@ class WinBridge extends EventEmitter {
       throw e;
     }
 
-    this._chunkDir       = chunkDir;
-    this._chunkIndex     = 0;
-    this._captureBinPath = captureBin;
-    this._ffmpegBinPath  = ffmpegBin;
-    this._micDevice      = await this._findDefaultMic(ffmpegBin);
+    this._chunkDir        = chunkDir;
+    this._processedLines  = 0;
+    this._emittedIndex    = 0;
+    this._pendingFinal    = [];
+    this._stopping        = false;
+    this._captureBinPath  = captureBin;
+    this._ffmpegBinPath   = ffmpegBin;
+    this._micDevice       = await this._findDefaultMic(ffmpegBin);
 
     try {
-      await this._spawnChunk(this._chunkPath(this._chunkIndex));
+      await this._spawnPersistent();
     } catch (err) {
       console.error('[win-bridge] startRecording failed:', err.message);
       const e = new Error(err.message);
       e.code = 'FFMPEG_UNAVAILABLE';
       throw e;
     }
-    this._chunkTimer = setTimeout(() => this._rollChunk(), CHUNK_DURATION_MS);
   }
 
   async stopRecording() {
     if (!this._captureProc && !this._ffmpegProc) throw new Error('No active recording');
 
-    clearTimeout(this._chunkTimer);
-    this._chunkTimer = null;
-    if (this._activeRoll) await this._activeRoll;
+    this._stopping = true;
 
-    const finalPath  = this._chunkPath(this._chunkIndex);
-    const finalIndex = this._chunkIndex;
+    // Kill audio_capture → its stdout EOF propagates to ffmpeg's stdin →
+    // the segment muxer finalizes the current (last) segment's WAV header,
+    // appends it to segments.list, and ffmpeg exits on its own.
+    const ffmpegProc = this._ffmpegProc;
+    await new Promise(resolve => {
+      let hardKill;
+      const finish = () => { clearTimeout(hardKill); resolve(); };
+      if (ffmpegProc) {
+        ffmpegProc.once('exit', finish);
+      } else {
+        finish();
+      }
+      try { this._captureProc?.kill(); } catch {}
+      this._captureProc = null;
+      try { ffmpegProc?.stdin?.end(); } catch {}
+      hardKill = setTimeout(() => { try { ffmpegProc?.kill(); } catch {} finish(); }, 10_000);
+    });
 
-    await this._stopCurrentChunk();
+    try { this._listWatcher?.close(); } catch {}
+    this._listWatcher = null;
+
+    // ffmpeg has fully exited, so segments.list is guaranteed flushed —
+    // pick up the just-closed final segment regardless of whether the
+    // watcher already caught it.
+    this._onListUpdated();
+
+    if (this._pendingFinal.length === 0) {
+      // ffmpeg didn't exit gracefully (hard-kill fallback fired), so
+      // write_trailer() never ran and segments.list never got the last
+      // entry appended. The file may still be on disk — fall back to the
+      // expected path by naming convention rather than failing outright.
+      const fallbackPath = path.join(this._chunkDir, `chunk-${this._emittedIndex}.wav`);
+      if (!fs.existsSync(fallbackPath)) {
+        throw new Error('No final chunk was written — segments.list has no new entries after stop.');
+      }
+      this._pendingFinal.push(fallbackPath);
+    }
+    const finalPath  = this._pendingFinal[this._pendingFinal.length - 1];
+    const finalIndex = this._emittedIndex;
 
     let fileSize = 0;
     try { fileSize = fs.statSync(finalPath).size; } catch {}
@@ -410,14 +459,16 @@ class WinBridge extends EventEmitter {
       throw new Error(`Recording chunk ${finalIndex} is empty at ${finalPath}. Check stderr above.`);
     }
 
-    this._chunkDir   = null;
-    this._chunkIndex = 0;
+    this._chunkDir     = null;
+    this._pendingFinal = [];
 
     return { path: finalPath, index: finalIndex };
   }
 
   shutdown() {
-    clearTimeout(this._chunkTimer);
+    this._stopping = true;
+    try { this._listWatcher?.close(); } catch {}
+    this._listWatcher = null;
     try { this._captureProc?.kill(); } catch {}
     try { this._ffmpegProc?.kill(); } catch {}
     this._captureProc = null;
