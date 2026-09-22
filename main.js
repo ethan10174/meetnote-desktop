@@ -81,10 +81,11 @@ async function uploadChunk(filePath, chunkIndex, meetingId, isFinal, userId) {
 // nativeBridge is an EventEmitter on mac/win; Linux stub has no .on.
 if (typeof nativeBridge.on === 'function') {
   nativeBridge.on('chunk-ready', ({ path: chunkPath, index }) => {
-    // Capture meetingId synchronously — stop-recording may clear it later.
+    // Capture meetingId/userId synchronously — stop-recording may clear them later.
     const meetingId = currentMeetingId;
-    console.log(`[main] chunk-ready: index=${index} path=${chunkPath}`);
-    uploadChunk(chunkPath, index, meetingId, false, null)
+    const userId    = currentUserId;
+    console.log(`[main] chunk-ready: index=${index} path=${chunkPath} userId=${userId ?? '(none)'}`);
+    uploadChunk(chunkPath, index, meetingId, false, userId)
       .then(r  => console.log(`[main] chunk ${index} uploaded:`, Object.keys(r)))
       .catch(err => {
         console.error(`[main] chunk ${index} upload failed:`, err.message);
@@ -387,8 +388,14 @@ ipcMain.handle('get-screen-recording-status', () => {
 // ── IPC: start recording — chunked native bridge ─────────────────────────────
 let currentRecordingDir = null;
 let currentMeetingId    = null;
+// Threaded through to every non-final chunk-ready upload below — without
+// this, only stop-recording's own userId argument reached the backend, so
+// every chunk *except* the final one (i.e. every chunk while the recording
+// was still in progress) got uploaded with no user_id and landed in the
+// "anonymous" storage folder instead of the real user's.
+let currentUserId       = null;
 
-ipcMain.handle('start-recording', async (_event, { meetingId } = {}) => {
+ipcMain.handle('start-recording', async (_event, { meetingId, userId } = {}) => {
   console.log('[main] start-recording received at', Date.now());
 
   // Recording must be tagged with the real Supabase meeting UUID from the
@@ -403,10 +410,11 @@ ipcMain.handle('start-recording', async (_event, { meetingId } = {}) => {
 
   try {
     currentMeetingId    = meetingId;
+    currentUserId        = userId ?? null;
     currentRecordingDir = path.join(os.tmpdir(), currentMeetingId);
     fs.mkdirSync(currentRecordingDir, { recursive: true });
     await nativeBridge.startRecording(currentRecordingDir);
-    console.log('[main] start-recording complete — ok, meetingId:', currentMeetingId);
+    console.log('[main] start-recording complete — ok, meetingId:', currentMeetingId, 'userId:', currentUserId ?? '(none — chunks will upload without a user_id)');
     return { ok: true };
   } catch (err) {
     console.error('[start-recording]', err.message);
@@ -415,6 +423,7 @@ ipcMain.handle('start-recording', async (_event, { meetingId } = {}) => {
     }
     currentRecordingDir = null;
     currentMeetingId    = null;
+    currentUserId        = null;
     if (err.code === 'FFMPEG_UNAVAILABLE' || err.code === 'EPIPE') {
       console.log('[main] start-recording complete — fallbackToBrowser');
       return { fallbackToBrowser: true };
@@ -428,8 +437,13 @@ ipcMain.handle('stop-recording', async (_event, { userId } = {}) => {
   console.log('[main] stop-recording received at', Date.now());
   const recordingDir = currentRecordingDir;
   const meetingId    = currentMeetingId;
+  // Prefer the userId the renderer hands stop-recording directly (freshest —
+  // covers the edge case where auth resolved after start-recording already
+  // ran with none) and fall back to what start-recording captured.
+  const resolvedUserId = userId ?? currentUserId;
   currentRecordingDir = null;
   currentMeetingId    = null;
+  currentUserId        = null;
 
   // No native recording active — renderer is using browser MediaRecorder fallback.
   if (!recordingDir) return { fallbackToBrowser: true };
@@ -440,7 +454,7 @@ ipcMain.handle('stop-recording', async (_event, { userId } = {}) => {
     finalPath = p;
     console.log(`[stop-recording] final chunk ${index}:`, finalPath);
 
-    const result = await uploadChunk(finalPath, index, meetingId, true, userId);
+    const result = await uploadChunk(finalPath, index, meetingId, true, resolvedUserId);
     console.log('[stop-recording] final chunk uploaded, result keys:', Object.keys(result));
     fs.rm(recordingDir, { recursive: true, force: true }, () => {});
     return result;
