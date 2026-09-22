@@ -301,18 +301,31 @@ class WinBridge extends EventEmitter {
   }
 
   // Gracefully stop the current chunk: kill audio_capture → EOF → ffmpeg writes WAV trailer.
+  //
+  // Captures the ffmpeg process reference up front rather than reading
+  // this._ffmpegProc from the timeout closure — by the time a fallback
+  // fires, the next chunk's roll may already have reassigned that field to
+  // a brand-new process, and killing "whatever this._ffmpegProc is now"
+  // would cut the next chunk short instead of the one being stopped.
   _stopCurrentChunk() {
     return new Promise(resolve => {
-      if (this._ffmpegProc) {
-        this._ffmpegProc.once('exit', () => { this._ffmpegProc = null; resolve(); });
+      const proc = this._ffmpegProc;
+      let hardKill;
+      const finish = () => { clearTimeout(hardKill); resolve(); };
+
+      if (proc) {
+        proc.once('exit', () => {
+          if (this._ffmpegProc === proc) this._ffmpegProc = null;
+          finish();
+        });
       } else {
-        resolve();
+        finish();
       }
       try { this._captureProc?.kill(); } catch {}
       this._captureProc = null;
-      try { this._ffmpegProc?.stdin?.end(); } catch {}
+      try { proc?.stdin?.end(); } catch {}
       // Hard-kill fallback after 10 s.
-      setTimeout(() => { try { this._ffmpegProc?.kill(); } catch {} resolve(); }, 10_000);
+      hardKill = setTimeout(() => { try { proc?.kill(); } catch {} finish(); }, 10_000);
     });
   }
 
