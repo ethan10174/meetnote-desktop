@@ -8,6 +8,7 @@ const nativeBridge = require('./native-bridge');
 const path           = require('path');
 const fs             = require('fs');
 const os             = require('os');
+const util            = require('util');
 const { execSync }   = require('child_process');
 const http           = require('http');
 
@@ -15,11 +16,56 @@ app.setName('MeetNote');
 
 const NEXT_URL          = 'https://meeting-frontend-ashy.vercel.app';
 const BACKEND_URL       = 'https://meeting-backend-production-ca80.up.railway.app/upload';
+const DEBUG_LOG_URL     = 'https://meeting-backend-production-ca80.up.railway.app/debug/electron-log';
 const SUPABASE_URL      = 'https://dpikisphgxwcysvvvltf.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRwaWtpc3BoZ3h3Y3lzdnZ2bHRmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc0Mjk4NjAsImV4cCI6MjA5MzAwNTg2MH0.doJpmszT7iR96HdmXjfiDLTbPJeBm7NZvJP1YenF_6g';
 
 let oauthServer = null; // loopback HTTP server used during OAuth
 let store       = null; // electron-store instance (ESM; initialized in app.whenReady)
+
+// ── Debug log shipping ─────────────────────────────────────────────────────
+// Forwards every console.log/console.error to the backend so Windows-side
+// logs are visible in Railway without needing the user's terminal. Patches
+// the *global* console rather than wrapping calls locally, so this also
+// picks up native-bridge.js's logging (which is most of what we actually
+// want to see — chunk timing, ffmpeg exit reasons) without touching that
+// file. currentMeetingId is declared later in this file, but it's only
+// *read* here inside a closure at call time, and nothing calls console.log
+// synchronously before that declaration runs, so there's no TDZ hazard.
+//
+// TEMPORARY: this is for diagnosing the Windows chunk-boundary bug. It ships
+// raw log text (which can include file paths / stack traces) to an
+// unauthenticated public endpoint — fine for a short debugging window, but
+// should be turned off or gated once that's resolved, not left on for all
+// production users indefinitely.
+const _origConsoleLog   = console.log.bind(console);
+const _origConsoleError = console.error.bind(console);
+
+function _shipLog(level, args) {
+  let message;
+  try { message = util.format(...args); } catch { message = '(unformattable log args)'; }
+
+  fetch(DEBUG_LOG_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      level,
+      message,
+      meeting_id: typeof currentMeetingId !== 'undefined' ? currentMeetingId : null,
+      timestamp: new Date().toISOString(),
+    }),
+  }).catch(() => {}); // best-effort — never let a network hiccup break logging
+}
+
+console.log = (...args) => {
+  _origConsoleLog(...args);
+  _shipLog('log', args);
+};
+
+console.error = (...args) => {
+  _origConsoleError(...args);
+  _shipLog('error', args);
+};
 
 // ── Supabase session persistence (electron-store) ─────────────────────────────
 
