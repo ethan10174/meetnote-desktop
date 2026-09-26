@@ -1,4 +1,4 @@
-const { contextBridge, ipcRenderer, shell } = require('electron');
+const { contextBridge, ipcRenderer } = require('electron');
 
 // Audio capture is now handled entirely in the main process via the native
 // ScreenCaptureKit bridge (native-bridge.js + resources/audio-recorder).
@@ -26,7 +26,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   getAppVersion: () => ipcRenderer.invoke('get-app-version'),
 
-  openExternal: (url) => shell.openExternal(url),
+  // Sandboxed preload (Electron's default since v20, and this window doesn't
+  // opt out via `sandbox: false`) doesn't expose `shell` through
+  // require('electron') at all — only contextBridge/ipcRenderer/nativeImage/
+  // webFrame/webUtils/crashReporter are in that restricted surface. Route
+  // through main instead, like every other call in this file already does.
+  openExternal: (url) => ipcRenderer.invoke('open-external', url),
 
   readFileBuffer: (filePath) => ipcRenderer.invoke('read-file-buffer', filePath),
 

@@ -565,6 +565,19 @@ ipcMain.handle('open-notification-settings', () => {
 
 ipcMain.handle('get-app-version', () => app.getVersion());
 
+// Renderer-triggered (e.g. OAuth sign-in links) — only allow http(s) so a
+// compromised/unexpected page can't use this to open a local file or a
+// custom protocol handler.
+ipcMain.handle('open-external', (_event, url) => {
+  let parsed;
+  try { parsed = new URL(url); } catch { return; }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    console.error('[open-external] refusing non-http(s) URL:', url);
+    return;
+  }
+  shell.openExternal(parsed.toString());
+});
+
 // ── Meeting detection ─────────────────────────────────────────────────────────
 let meetingActive        = false; // is a meeting currently detected?
 let hasNotifiedForMeeting = false; // have we shown the notification for this meeting?
