@@ -59,11 +59,26 @@ jobs:
 
       - name: Create DMG
         run: |
+          brew install create-dmg
           DMG_SRC=dist/dmg-src
           mkdir -p "$DMG_SRC"
           cp -R "$APP_PATH" "$DMG_SRC/"
-          ln -s /Applications "$DMG_SRC/Applications"
-          hdiutil create -volname "MeetNote" -srcfolder "$DMG_SRC" -ov -format UDZO dist/MeetNote.dmg
+          # Positions/window size match build/dmg-background.png and
+          # package.json's build.dmg config (kept in sync manually — this
+          # step is what actually renders it, electron-builder isn't
+          # building the DMG itself here because of the keychain issue
+          # the surrounding steps work around).
+          create-dmg \
+            --volname "MeetNote" \
+            --background "build/dmg-background.png" \
+            --window-size 540 380 \
+            --icon-size 100 \
+            --icon "MeetNote.app" 140 190 \
+            --hide-extension "MeetNote.app" \
+            --app-drop-link 400 190 \
+            --no-internet-enable \
+            dist/MeetNote.dmg \
+            "$DMG_SRC/"
 
       - name: Notarize DMG
         env:

@@ -74,10 +74,15 @@
     },
     "dmg": {
       "title": "MeetNote",
+      "background": "build/dmg-background.png",
       "window": {
         "width": 540,
         "height": 380
-      }
+      },
+      "contents": [
+        { "x": 140, "y": 190, "type": "file" },
+        { "x": 400, "y": 190, "type": "link", "path": "/Applications" }
+      ]
     }
   },
   "devDependencies": {
