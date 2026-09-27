@@ -42,4 +42,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on('chunk-upload-error', listener);
     return () => ipcRenderer.removeListener('chunk-upload-error', listener);
   },
+
+  // meetnote:// deep links (e.g. the OAuth return trip — see
+  // _calendar_return_page in backend/main.py and handleDeepLink in main.js).
+  // getPendingDeepLink covers the cold-start case: the link can arrive
+  // before this page has mounted a listener for the live 'deep-link' event,
+  // so main buffers the last one for the renderer to claim once ready.
+  onDeepLink: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on('deep-link', listener);
+    return () => ipcRenderer.removeListener('deep-link', listener);
+  },
+  getPendingDeepLink: () => ipcRenderer.invoke('get-pending-deep-link'),
 });

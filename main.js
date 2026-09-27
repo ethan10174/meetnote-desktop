@@ -67,6 +67,83 @@ console.error = (...args) => {
   _shipLog('error', args);
 };
 
+// ── Custom protocol (meetnote://) — desktop return-trip after OAuth ──────────
+// The backend's /calendar/*/callback lands the user's browser on an HTML
+// page (see _calendar_return_page in backend/main.py) that immediately
+// navigates to meetnote://calendar/connected?provider=... — the OS hands
+// that off to this app instead of it being a real webpage, since MeetNote
+// registers itself as the handler for the "meetnote" scheme below.
+if (process.defaultApp) {
+  // Dev mode (`electron .`): there's no single .exe for the OS to relaunch,
+  // so the registration has to spell out the exact argv it should replay.
+  if (process.argv.length >= 2) {
+    app.setAsDefaultProtocolClient('meetnote', process.execPath, [path.resolve(process.argv[1])]);
+  }
+} else {
+  app.setAsDefaultProtocolClient('meetnote');
+}
+
+// Buffered rather than only event-based: on a cold start (app not already
+// running) this fires right after createWindow(), while the page is still
+// loading Next.js/mounting React — sending the IPC event immediately would
+// very likely arrive before the renderer has registered a listener for it,
+// and Electron doesn't queue undelivered messages. The renderer pulls this
+// once on mount (get-pending-deep-link) in addition to listening live, so
+// whichever timing actually happens, the link isn't lost.
+let pendingDeepLink = null;
+
+function handleDeepLink(url) {
+  let parsed;
+  try { parsed = new URL(url); } catch { return; }
+  if (parsed.protocol !== 'meetnote:') return;
+
+  console.log('[deep-link] received:', url);
+  const payload = {
+    host: parsed.hostname, // e.g. "calendar"
+    path: parsed.pathname, // e.g. "/connected"
+    params: Object.fromEntries(parsed.searchParams),
+  };
+  pendingDeepLink = payload;
+
+  const win = BrowserWindow.getAllWindows()[0];
+  if (!win) return;
+  if (win.isMinimized()) win.restore();
+  win.show();
+  win.focus();
+  win.webContents.send('deep-link', payload); // best-effort live delivery
+}
+
+ipcMain.handle('get-pending-deep-link', () => {
+  const link = pendingDeepLink;
+  pendingDeepLink = null;
+  return link;
+});
+
+// macOS: fires directly on the running instance; a cold start via the link
+// is queued by Electron and delivered once app.whenReady() resolves, which
+// is why this listener is registered unconditionally at module load rather
+// than inside that .then().
+app.on('open-url', (event, url) => {
+  event.preventDefault();
+  handleDeepLink(url);
+});
+
+// Windows/Linux: clicking a meetnote:// link launches a *new* OS process
+// with the URL as an argv entry rather than emitting 'open-url'. The single
+// -instance lock funnels that into 'second-instance' on the already-running
+// instance instead of actually opening a second MeetNote window.
+const _gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!_gotSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on('second-instance', (_event, argv) => {
+    const deepLink = argv.find(a => a.startsWith('meetnote://'));
+    if (deepLink) handleDeepLink(deepLink);
+    const win = BrowserWindow.getAllWindows()[0];
+    if (win) { if (win.isMinimized()) win.restore(); win.show(); win.focus(); }
+  });
+}
+
 // ── Supabase session persistence (electron-store) ─────────────────────────────
 
 ipcMain.on('get-session-sync', (event) => {
@@ -740,6 +817,13 @@ app.whenReady().then(async () => {
   store = new Store();
 
   createWindow();
+
+  // Windows/Linux cold start via a meetnote:// link: the OS launches this
+  // as a brand-new process with the URL as an argv entry, which won't hit
+  // 'second-instance' (that only fires for a *subsequent* launch attempt
+  // once an instance already holds the lock) — check argv directly here too.
+  const coldStartDeepLink = process.argv.find(a => a.startsWith('meetnote://'));
+  if (coldStartDeepLink) handleDeepLink(coldStartDeepLink);
 
   if (Notification.isSupported()) {
     new Notification({ title: 'MeetNote', body: 'Meeting detection is active.', silent: true }).show();

@@ -12,6 +12,12 @@
   "build": {
     "appId": "com.meetnote.app",
     "productName": "MeetNote",
+    "protocols": [
+      {
+        "name": "MeetNote",
+        "schemes": ["meetnote"]
+      }
+    ],
     "directories": {
       "output": "dist"
     },
