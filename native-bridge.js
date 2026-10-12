@@ -196,10 +196,47 @@ class WinBridge extends EventEmitter {
     this._chunkIndex     = 0;
     this._chunkTimer     = null;
     this._activeRoll     = null;
-    // Cached on first startRecording so rolls don't re-enumerate.
-    this._captureBinPath = null;
-    this._ffmpegBinPath  = null;
-    this._micDevice      = null;
+    // Cached on first startRecording (or warmMicCache()) so rolls — and
+    // later recordings — don't re-enumerate. _micDeviceResolved is a
+    // separate flag rather than checking `_micDevice !== null`, because
+    // null is itself a legitimate resolved value (no mic present) — using
+    // it as the "not cached yet" sentinel would make every machine with no
+    // mic re-enumerate on every single recording, defeating the cache.
+    this._captureBinPath  = null;
+    this._ffmpegBinPath   = null;
+    this._micDevice       = null;
+    this._micDeviceResolved = false;
+  }
+
+  // Pre-resolves the default mic outside the recording-start critical path
+  // — _findDefaultMic() spawns a full ffmpeg subprocess to walk DirectShow
+  // devices, which is the ~3s Windows pays at the start of every recording
+  // otherwise. Call this once at app startup; startRecording() below then
+  // finds the cache already warm and skips enumeration entirely. Safe to
+  // call multiple times (a no-op once resolved) and swallows its own
+  // errors since this runs in the background, unprompted by the user —
+  // worst case on failure is startRecording() enumerating fresh like today.
+  async warmMicCache() {
+    if (this._micDeviceResolved) return;
+    const ffmpegBin = this._ffmpegBin();
+    if (!ffmpegBin) return; // startRecording() will surface the real error later
+    try {
+      this._micDevice = await this._findDefaultMic(ffmpegBin);
+      this._micDeviceResolved = true;
+      console.log('[win-bridge] mic cache warmed at startup — mic:', this._micDevice ?? '(none)');
+    } catch (err) {
+      console.error('[win-bridge] mic cache warm-up failed (will enumerate on first recording instead):', err.message);
+    }
+  }
+
+  // Called when the renderer reports navigator.mediaDevices.ondevicechange
+  // (relayed over IPC — see main.js's 'audio-devices-changed' handler).
+  // Clears the cache so the next startRecording() re-enumerates instead of
+  // handing back a mic that was just plugged in or unplugged.
+  invalidateMicCache() {
+    console.log('[win-bridge] audio devices changed — invalidating cached mic');
+    this._micDevice = null;
+    this._micDeviceResolved = false;
   }
 
   // Locate audio_capture.exe: resources folder (packaged) or native/ subdir (dev).
@@ -412,7 +449,10 @@ class WinBridge extends EventEmitter {
     this._chunkIndex     = 0;
     this._captureBinPath = captureBin;
     this._ffmpegBinPath  = ffmpegBin;
-    this._micDevice      = await this._findDefaultMic(ffmpegBin);
+    if (!this._micDeviceResolved) {
+      this._micDevice = await this._findDefaultMic(ffmpegBin);
+      this._micDeviceResolved = true;
+    }
 
     try {
       await this._spawnChunk(this._chunkPath(this._chunkIndex));

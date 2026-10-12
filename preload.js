@@ -54,4 +54,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
     return () => ipcRenderer.removeListener('deep-link', listener);
   },
   getPendingDeepLink: () => ipcRenderer.invoke('get-pending-deep-link'),
+
+  // Relays navigator.mediaDevices.ondevicechange (renderer-only API) to
+  // main, which invalidates its cached default-mic lookup (see
+  // warmMicCache/invalidateMicCache in native-bridge.js) so a mic plugged
+  // in or unplugged after app launch is picked up on the next recording
+  // instead of being stuck with whatever was resolved at startup.
+  notifyAudioDevicesChanged: () => ipcRenderer.send('audio-devices-changed'),
 });

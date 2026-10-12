@@ -655,6 +655,18 @@ ipcMain.handle('open-external', (_event, url) => {
   shell.openExternal(parsed.toString());
 });
 
+// Relayed from the renderer's navigator.mediaDevices.ondevicechange — the
+// main process has no native audio-device-change hook of its own on
+// Windows, so the renderer is the only place this can actually be observed.
+// Invalidates the cached mic (see nativeBridge.warmMicCache() above) so the
+// next recording re-enumerates instead of using a mic that was just
+// plugged in or unplugged.
+ipcMain.on('audio-devices-changed', () => {
+  if (typeof nativeBridge.invalidateMicCache === 'function') {
+    nativeBridge.invalidateMicCache();
+  }
+});
+
 // ── Meeting detection ─────────────────────────────────────────────────────────
 let meetingActive        = false; // is a meeting currently detected?
 let hasNotifiedForMeeting = false; // have we shown the notification for this meeting?
@@ -817,6 +829,15 @@ app.whenReady().then(async () => {
   store = new Store();
 
   createWindow();
+
+  // Windows: pre-resolve the default mic now, off the recording-start
+  // critical path, so startRecording() finds it already cached instead of
+  // paying for a DirectShow device-enumeration subprocess (~3s) when the
+  // user actually hits record. Fire-and-forget — failures just mean the
+  // first recording enumerates fresh, same as before this existed.
+  if (typeof nativeBridge.warmMicCache === 'function') {
+    nativeBridge.warmMicCache().catch(() => {});
+  }
 
   // Windows/Linux cold start via a meetnote:// link: the OS launches this
   // as a brand-new process with the URL as an argv entry, which won't hit
