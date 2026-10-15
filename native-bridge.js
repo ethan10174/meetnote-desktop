@@ -177,16 +177,18 @@ class MacBridge extends EventEmitter {
 // audio_capture.exe (WASAPI loopback) → raw PCM stdout
 //   → piped into ffmpeg stdin as s16le 44100 2ch (system audio)
 //   + ffmpeg DirectShow mic input (best-effort; omitted if no mic found)
-//   → WAV chunk file on disk
+//   → raw PCM on ffmpeg stdout → split into chunk-N.wav files by this class
 //
-// Rolling: kill audio_capture → its stdout EOF propagates to ffmpeg stdin →
-// ffmpeg finalises the WAV header and exits cleanly. Then spawn fresh pair.
+// Rolling: audio_capture and ffmpeg run once for the whole recording. Every
+// minute we close the current WAV file (patching its header) and open the
+// next one between two PCM writes, so capture never stops and no audio is
+// lost at chunk boundaries. The old kill/respawn rotation dropped ~2.4 s per
+// minute on Windows (Oct 2026 test: 50:15 meeting → 48:23 of audio).
 //
-// NOTE: an ffmpeg `-f segment` persistent-process version of this was tried
-// (single long-lived process, muxer handles rotation internally, no restart
-// gap) but broke chunk uploads on Windows and was reverted. Back to
-// kill/restart; see _stopCurrentChunk()/_spawnChunk() for what's being done
-// to close the restart gap without that rewrite.
+// NOTE: an ffmpeg `-f segment` version was tried earlier and broke chunk
+// uploads (detecting finished segments was unreliable), which is why the
+// file splitting is done here instead: chunk-ready only fires after we've
+// closed the file ourselves.
 class WinBridge extends EventEmitter {
   constructor() {
     super();
@@ -195,7 +197,10 @@ class WinBridge extends EventEmitter {
     this._chunkDir       = null;
     this._chunkIndex     = 0;
     this._chunkTimer     = null;
-    this._activeRoll     = null;
+    this._chunkFd        = null;
+    this._chunkBytes     = 0;
+    this._pcmCarry       = Buffer.alloc(0);
+    this._ffmpegDone     = null;
     // Cached on first startRecording (or warmMicCache()) so rolls — and
     // later recordings — don't re-enumerate. _micDeviceResolved is a
     // separate flag rather than checking `_micDevice !== null`, because
@@ -291,9 +296,12 @@ class WinBridge extends EventEmitter {
     return path.join(this._chunkDir, `chunk-${n}.wav`);
   }
 
-  // Spawn audio_capture.exe + ffmpeg for a single chunk output file.
-  // Resolves when ffmpeg signals it is actively recording.
-  _spawnChunk(outputPath) {
+  // Spawn audio_capture.exe + ffmpeg ONCE for the whole recording. ffmpeg
+  // mixes system audio (+ mic) and writes raw PCM to stdout; we split that
+  // stream into chunk WAV files ourselves (see _onPcm/_rollChunk), so a
+  // rotation never stops capture. Resolves when ffmpeg signals it is
+  // actively recording.
+  _spawnCapture() {
     const captureBin = this._captureBinPath;
     const ffmpegBin  = this._ffmpegBinPath;
     const mic        = this._micDevice;
@@ -304,128 +312,109 @@ class WinBridge extends EventEmitter {
     this._captureProc.stderr.on('data', d => process.stderr.write('[audio_capture] ' + d));
 
     // With a mic present, the dshow input is a live device with no EOF of
-    // its own — only the pipe:0 (system audio) input gets one when we kill
-    // audio_capture. `duration=first` tells amix to end its output once
-    // pipe:0 (the first input) ends, but that only stops the *filter*
-    // output; nothing upstream of it guarantees the ffmpeg *process* exits
-    // promptly. `-shortest` is the process-level version of the same idea —
-    // it tells the muxer/main loop itself to stop encoding once the
-    // shortest input ends — as a second, more reliable line of defense
-    // against ffmpeg hanging on the still-live mic input after rotation.
+    // its own — only pipe:0 (system audio) gets one when we kill
+    // audio_capture at stop. `duration=first` ends the amix output once
+    // pipe:0 ends, and `-shortest` makes the ffmpeg process itself exit
+    // instead of hanging on the still-live mic input.
     const ffmpegArgs = mic ? [
       '-f', 's16le', '-ar', '44100', '-ac', '2', '-i', 'pipe:0',
       '-f', 'dshow', '-i', `audio=${mic}`,
       '-filter_complex', 'amix=inputs=2:duration=first',
       '-acodec', 'pcm_s16le', '-ar', '44100', '-ac', '2',
       '-shortest',
-      '-y', outputPath,
+      '-f', 's16le', 'pipe:1',
     ] : [
       '-f', 's16le', '-ar', '44100', '-ac', '2', '-i', 'pipe:0',
       '-acodec', 'pcm_s16le', '-ar', '44100', '-ac', '2',
-      '-y', outputPath,
+      '-f', 's16le', 'pipe:1',
     ];
 
-    console.log(`[win-bridge] spawning chunk → ${outputPath}${mic ? ' (+ mic)' : ''}`);
+    console.log(`[win-bridge] spawning continuous capture${mic ? ' (+ mic)' : ''}`);
     const spawnedAt = Date.now();
-    this._ffmpegProc = spawn(ffmpegBin, ffmpegArgs, { stdio: ['pipe', 'ignore', 'pipe'] });
-    this._ffmpegProc.stdin.on('error', (err) => {
+    const proc = spawn(ffmpegBin, ffmpegArgs, { stdio: ['pipe', 'pipe', 'pipe'] });
+    this._ffmpegProc = proc;
+    proc.stdin.on('error', (err) => {
       console.error('[win-bridge] ffmpeg stdin error (EPIPE suppressed):', err.message);
     });
-    this._captureProc.stdout.pipe(this._ffmpegProc.stdin);
+    this._captureProc.stdout.pipe(proc.stdin);
+    proc.stdout.on('data', (buf) => this._onPcm(buf));
+    this._ffmpegDone = new Promise(res => proc.stdout.once('close', res));
 
     return new Promise((resolve, reject) => {
       let resolved = false;
       const done = (err) => {
         if (resolved) return;
         resolved = true;
-        console.log(`[win-bridge] chunk start resolved in ${Date.now() - spawnedAt}ms${err ? ' (error: ' + err.message + ')' : ''}`);
+        console.log(`[win-bridge] capture start resolved in ${Date.now() - spawnedAt}ms${err ? ' (error: ' + err.message + ')' : ''}`);
         err ? reject(err) : resolve();
       };
 
-      this._ffmpegProc.stderr.on('data', d => {
+      proc.stderr.on('data', d => {
         const text = d.toString();
         process.stderr.write('[ffmpeg] ' + text);
         if (/Press \[q\]|size=\s*\d+kB/i.test(text)) done();
       });
       this._captureProc.on('error', done);
-      this._ffmpegProc.on('error', done);
-      this._ffmpegProc.on('exit', (code, sig) => {
-        this._ffmpegProc = null;
+      proc.on('error', done);
+      proc.on('exit', (code, sig) => {
+        if (this._ffmpegProc === proc) this._ffmpegProc = null;
+        if (resolved && this._chunkDir) {
+          console.error(`[win-bridge] ffmpeg exited mid-recording (code=${code}, signal=${sig})`);
+        }
         done(new Error(`ffmpeg exited before recording started (code=${code}, signal=${sig})`));
       });
-      // Resolve after 2 s regardless — some builds don't print the ready
-      // line. Was 8 s; if this fallback is what's actually firing every
-      // roll on the reported hardware, shortening it directly shrinks the
-      // observed gap even before -shortest above is confirmed to help.
+      // Resolve after 2 s regardless — some builds don't print the ready line.
       setTimeout(() => done(), 2_000);
     });
   }
 
-  // Gracefully stop the current chunk: kill audio_capture → EOF → ffmpeg writes WAV trailer.
-  //
-  // Captures the ffmpeg process reference up front rather than reading
-  // this._ffmpegProc from the timeout closure — by the time a fallback
-  // fires, the next chunk's roll may already have reassigned that field to
-  // a brand-new process, and killing "whatever this._ffmpegProc is now"
-  // would cut the next chunk short instead of the one being stopped.
-  _stopCurrentChunk() {
-    return new Promise(resolve => {
-      const proc = this._ffmpegProc;
-      const stoppedAt = Date.now();
-      let hardKill;
-      const finish = (viaHardKill) => {
-        clearTimeout(hardKill);
-        console.log(`[win-bridge] chunk stop resolved in ${Date.now() - stoppedAt}ms${viaHardKill ? ' (hard-kill fallback)' : ''}`);
-        resolve();
-      };
-
-      if (proc) {
-        proc.once('exit', () => {
-          if (this._ffmpegProc === proc) this._ffmpegProc = null;
-          finish(false);
-        });
-      } else {
-        finish(false);
-      }
-      try { this._captureProc?.kill(); } catch {}
-      this._captureProc = null;
-      try { proc?.stdin?.end(); } catch {}
-      // Hard-kill fallback, shortened from 10 s to 3 s: if -shortest above
-      // doesn't fully fix the mic-path hang, this bounds the worst case
-      // instead of silently eating a full 10 s every rotation. A hard-kill
-      // may leave the WAV header's size field wrong (data is still intact),
-      // which is an acceptable trade for a bounded gap versus a silent 10 s
-      // stall — logged distinctly so it's visible if it's still firing.
-      hardKill = setTimeout(() => { try { proc?.kill(); } catch {} finish(true); }, 3_000);
-    });
+  // Open chunk N for writing with a placeholder WAV header; sizes are
+  // patched in by _closeChunk once the chunk's length is known.
+  _openChunk(n) {
+    const p = this._chunkPath(n);
+    this._chunkFd    = fs.openSync(p, 'w');
+    this._chunkBytes = 0;
+    fs.writeSync(this._chunkFd, wavHeader(0));
+    return p;
   }
 
+  // Patch the WAV header with the real data size and close the file.
+  // Returns the number of PCM bytes in the chunk.
+  _closeChunk() {
+    if (this._chunkFd === null) return 0;
+    const bytes = this._chunkBytes;
+    fs.writeSync(this._chunkFd, wavHeader(bytes), 0, WAV_HEADER_BYTES, 0);
+    fs.closeSync(this._chunkFd);
+    this._chunkFd = null;
+    return bytes;
+  }
+
+  // Append PCM from ffmpeg to the current chunk. Only whole sample frames
+  // are written so every chunk starts on a frame boundary; any partial
+  // frame is carried over to the next write (or the next chunk).
+  _onPcm(buf) {
+    if (this._chunkFd === null) return;
+    const data = this._pcmCarry.length ? Buffer.concat([this._pcmCarry, buf]) : buf;
+    const whole = data.length - (data.length % WAV_BLOCK_ALIGN);
+    this._pcmCarry = data.subarray(whole);
+    if (whole === 0) return;
+    fs.writeSync(this._chunkFd, data, 0, whole);
+    this._chunkBytes += whole;
+  }
+
+  // Called by the 1-minute timer. Closes the current chunk and opens the
+  // next one synchronously between two PCM writes, so no audio is dropped
+  // at the boundary — capture never stops.
   _rollChunk() {
-    if (this._activeRoll) return; // re-entry guard
-    this._activeRoll = this._doRoll().finally(() => { this._activeRoll = null; });
-  }
-
-  async _doRoll() {
-    const finishedPath  = this._chunkPath(this._chunkIndex);
+    if (this._chunkFd === null) return;
     const finishedIndex = this._chunkIndex;
-
-    await this._stopCurrentChunk();
-
-    let fileSize = 0;
-    try { fileSize = fs.statSync(finishedPath).size; } catch {}
-    console.log(`[win-bridge] chunk ${finishedIndex} finalized — ${fileSize} bytes`);
+    const finishedPath  = this._chunkPath(finishedIndex);
+    const bytes = this._closeChunk();
+    console.log(`[win-bridge] chunk ${finishedIndex} finalized — ${bytes + WAV_HEADER_BYTES} bytes`);
 
     this._chunkIndex++;
-
-    // Emit before spawning next chunk so upload starts in parallel with next chunk startup.
+    this._openChunk(this._chunkIndex);
     this.emit('chunk-ready', { path: finishedPath, index: finishedIndex });
-
-    try {
-      await this._spawnChunk(this._chunkPath(this._chunkIndex));
-    } catch (err) {
-      console.error('[win-bridge] error starting next chunk:', err.message);
-      return;
-    }
 
     this._chunkTimer = setTimeout(() => this._rollChunk(), CHUNK_DURATION_MS);
   }
@@ -447,6 +436,7 @@ class WinBridge extends EventEmitter {
 
     this._chunkDir       = chunkDir;
     this._chunkIndex     = 0;
+    this._pcmCarry       = Buffer.alloc(0);
     this._captureBinPath = captureBin;
     this._ffmpegBinPath  = ffmpegBin;
     if (!this._micDeviceResolved) {
@@ -454,10 +444,15 @@ class WinBridge extends EventEmitter {
       this._micDeviceResolved = true;
     }
 
+    // Open chunk 0 before spawning so the first PCM bytes have somewhere to go.
+    this._openChunk(0);
     try {
-      await this._spawnChunk(this._chunkPath(this._chunkIndex));
+      await this._spawnCapture();
     } catch (err) {
       console.error('[win-bridge] startRecording failed:', err.message);
+      this.shutdown();
+      this._closeChunk();
+      this._chunkDir = null;
       const e = new Error(err.message);
       e.code = 'FFMPEG_UNAVAILABLE';
       throw e;
@@ -470,22 +465,37 @@ class WinBridge extends EventEmitter {
 
     clearTimeout(this._chunkTimer);
     this._chunkTimer = null;
-    if (this._activeRoll) await this._activeRoll;
 
     const finalPath  = this._chunkPath(this._chunkIndex);
     const finalIndex = this._chunkIndex;
 
-    await this._stopCurrentChunk();
-
-    let fileSize = 0;
-    try { fileSize = fs.statSync(finalPath).size; } catch {}
-    console.log(`[win-bridge] final chunk ${finalIndex} — ${finalPath} (${fileSize} bytes)`);
-    if (fileSize === 0) {
-      throw new Error(`Recording chunk ${finalIndex} is empty at ${finalPath}. Check stderr above.`);
+    // Kill audio_capture → its stdout EOF propagates to ffmpeg stdin →
+    // ffmpeg flushes the remaining PCM to stdout and exits. Hard-kill after
+    // 3 s if it hangs; everything already received is in the chunk file
+    // and the header is patched by us, not ffmpeg, so nothing is lost.
+    const proc = this._ffmpegProc;
+    try { this._captureProc?.kill(); } catch {}
+    this._captureProc = null;
+    if (proc) {
+      const hardKill = setTimeout(() => {
+        console.log('[win-bridge] ffmpeg did not exit after stop (hard-kill fallback)');
+        try { proc.kill(); } catch {}
+      }, 3_000);
+      await this._ffmpegDone;
+      clearTimeout(hardKill);
     }
+    this._ffmpegProc = null;
+
+    const bytes = this._closeChunk();
+    console.log(`[win-bridge] final chunk ${finalIndex} — ${finalPath} (${bytes + WAV_HEADER_BYTES} bytes)`);
 
     this._chunkDir   = null;
     this._chunkIndex = 0;
+    this._pcmCarry   = Buffer.alloc(0);
+
+    if (bytes === 0) {
+      throw new Error(`Recording chunk ${finalIndex} is empty at ${finalPath}. Check stderr above.`);
+    }
 
     return { path: finalPath, index: finalIndex };
   }
@@ -497,6 +507,31 @@ class WinBridge extends EventEmitter {
     this._captureProc = null;
     this._ffmpegProc  = null;
   }
+}
+
+// 44-byte canonical WAV header for 16-bit stereo 44.1 kHz PCM, matching
+// what audio_capture.exe produces.
+const WAV_SAMPLE_RATE = 44100;
+const WAV_CHANNELS    = 2;
+const WAV_BLOCK_ALIGN = WAV_CHANNELS * 2;
+const WAV_HEADER_BYTES = 44;
+
+function wavHeader(dataBytes) {
+  const h = Buffer.alloc(WAV_HEADER_BYTES);
+  h.write('RIFF', 0);
+  h.writeUInt32LE(36 + dataBytes, 4);
+  h.write('WAVE', 8);
+  h.write('fmt ', 12);
+  h.writeUInt32LE(16, 16);
+  h.writeUInt16LE(1, 20);
+  h.writeUInt16LE(WAV_CHANNELS, 22);
+  h.writeUInt32LE(WAV_SAMPLE_RATE, 24);
+  h.writeUInt32LE(WAV_SAMPLE_RATE * WAV_BLOCK_ALIGN, 28);
+  h.writeUInt16LE(WAV_BLOCK_ALIGN, 32);
+  h.writeUInt16LE(16, 34);
+  h.write('data', 36);
+  h.writeUInt32LE(dataBytes, 40);
+  return h;
 }
 
 // ── Export the right bridge for the current platform ─────────────────────────
